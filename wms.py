@@ -64,6 +64,7 @@ if not st.session_state.user:
 
 user = st.session_state.user
 role = str(user.get("role","staff")).lower()
+operator = user.get("username","unknown") # 用嚟記錄係邊個做
 st.sidebar.write(f"👤 {user['name']} | {role}")
 if st.sidebar.button("登出"):
     st.session_state.user=None
@@ -121,8 +122,8 @@ with tab_in:
             uom = st.selectbox("UOM *必填", ["PCS","KG","BOX"])
             if st.form_submit_button("確認入庫"):
                 full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
-                append_row("Inbound", [full_dt, ins, mfd.strftime("%d/%m/%Y") if mfd else "", sku, qty, uom])
-                st.success("入庫成功")
+                append_row("Inbound", [full_dt, ins, mfd.strftime("%d/%m/%Y") if mfd else "", sku, qty, uom, operator])
+                st.success(f"入庫成功 - 操作員: {operator}")
     with col2:
         st.markdown("**2. 批量入庫上傳**")
         st.download_button("下載入庫範本", data="Receiving Date,Inspection Note #,MFD,SKU,QTY,UOM\n2026-05-13,IN-001,01/01/2026,SPBMC042,10,PCS\n", file_name="Inbound_Template.csv")
@@ -134,12 +135,11 @@ with tab_in:
             if st.button("確認批量入庫"):
                 rows=[]
                 for _, r in df_in.iterrows():
-                    # 處理日期
                     rd = str(r.get("Receiving Date","") or datetime.date.today().strftime("%Y-%m-%d"))
                     mfd_str = str(r.get("MFD",""))
-                    rows.append([rd, str(r.get("Inspection Note #","")), mfd_str, str(r.get("SKU","")), str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS")])
+                    rows.append([rd, str(r.get("Inspection Note #","")), mfd_str, str(r.get("SKU","")), str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
                 append_rows("Inbound", rows)
-                st.success(f"已批量入庫 {len(rows)} 筆"); st.balloons()
+                st.success(f"已批量入庫 {len(rows)} 筆 - 操作員: {operator}"); st.balloons()
 
 # --- 出庫：單個 + 批量 ---
 with tab_out:
@@ -157,8 +157,8 @@ with tab_out:
             uom = st.selectbox("UOM *必填", ["PCS","KG","BOX"], key="uom_out")
             if st.form_submit_button("確認出庫"):
                 full_dt = datetime.datetime.combine(rel_date, rel_time).strftime("%Y-%m-%d %H:%M:%S")
-                append_row("Outbound", [full_dt, tr, mfd.strftime("%d/%m/%Y") if mfd else "", sku, qty, uom])
-                st.success("出庫成功")
+                append_row("Outbound", [full_dt, tr, mfd.strftime("%d/%m/%Y") if mfd else "", sku, qty, uom, operator])
+                st.success(f"出庫成功 - 操作員: {operator}")
     with col2:
         st.markdown("**2. 批量出庫上傳**")
         st.download_button("下載出庫範本", data="Release Date,Transfer Note #,MFD,SKU,QTY,UOM\n2026-05-13,TR-001,01/01/2026,SPBMC042,5,PCS\n", file_name="Outbound_Template.csv", key="dl_out")
@@ -172,44 +172,41 @@ with tab_out:
                 for _, r in df_out.iterrows():
                     rd = str(r.get("Release Date","") or datetime.date.today().strftime("%Y-%m-%d"))
                     mfd_str = str(r.get("MFD",""))
-                    rows.append([rd, str(r.get("Transfer Note #","")), mfd_str, str(r.get("SKU","")), str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS")])
+                    rows.append([rd, str(r.get("Transfer Note #","")), mfd_str, str(r.get("SKU","")), str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
                 append_rows("Outbound", rows)
-                st.success(f"已批量出庫 {len(rows)} 筆"); st.balloons()
+                st.success(f"已批量出庫 {len(rows)} 筆 - 操作員: {operator}"); st.balloons()
 
 with tab_view:
     st.subheader("📦 即時庫存結餘 = 入庫 - 出庫")
     df_in = load_df("Inbound")
     df_out = load_df("Outbound")
-    
+
     if df_in.empty and df_out.empty:
         st.info("未有入出庫紀錄")
     else:
-        # 轉數字
         if not df_in.empty:
             df_in["QTY"] = pd.to_numeric(df_in["QTY"], errors='coerce').fillna(0)
             in_sum = df_in.groupby("SKU")["QTY"].sum().reset_index().rename(columns={"QTY":"總入庫"})
         else:
             in_sum = pd.DataFrame(columns=["SKU","總入庫"])
-            
+
         if not df_out.empty:
             df_out["QTY"] = pd.to_numeric(df_out["QTY"], errors='coerce').fillna(0)
             out_sum = df_out.groupby("SKU")["QTY"].sum().reset_index().rename(columns={"QTY":"總出庫"})
         else:
             out_sum = pd.DataFrame(columns=["SKU","總出庫"])
 
-        # 合併
         df_stock = pd.merge(df_master, in_sum, on="SKU", how="left")
         df_stock = pd.merge(df_stock, out_sum, on="SKU", how="left")
         df_stock["總入庫"] = df_stock["總入庫"].fillna(0)
         df_stock["總出庫"] = df_stock["總出庫"].fillna(0)
         df_stock["現有庫存"] = df_stock["總入庫"] - df_stock["總出庫"]
-        
-        # 標紅負庫存
+
         st.dataframe(df_stock.style.map(lambda x: 'color: red; font-weight: bold' if x < 0 else '', subset=['現有庫存']), use_container_width=True)
-        
+
         st.divider()
         col_a, col_b = st.columns(2)
         with col_a:
-            st.write("Inbound 明細"); st.dataframe(df_in, use_container_width=True, height=300)
+            st.write("Inbound 明細 (含操作員)"); st.dataframe(df_in, use_container_width=True, height=300)
         with col_b:
-            st.write("Outbound 明細"); st.dataframe(df_out, use_container_width=True, height=300)
+            st.write("Outbound 明細 (含操作員)"); st.dataframe(df_out, use_container_width=True, height=300)
