@@ -37,32 +37,38 @@ def update_stock_sheet():
         df_out = load_df("Outbound")
         if df_m.empty: return
         df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
-        if not df_in.empty and "SKU" in df_in.columns:
-            df_in["QTY"] = pd.to_numeric(df_in["QTY"], errors='coerce').fillna(0)
+
+        if not df_in.empty and "SKU" in df_in.columns and "QTY" in df_in.columns:
             df_in["SKU"] = df_in["SKU"].astype(str).str.strip()
-            in_sum = df_in.groupby("SKU")["QTY"].sum().reset_index().rename(columns={"QTY":"總入庫"})
+            df_in["QTY"] = pd.to_numeric(df_in["QTY"], errors='coerce').fillna(0)
+            in_sum = df_in.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"})
         else: in_sum = pd.DataFrame(columns=["SKU","總入庫"])
-        if not df_out.empty and "SKU" in df_out.columns:
-            df_out["QTY"] = pd.to_numeric(df_out["QTY"], errors='coerce').fillna(0)
+
+        if not df_out.empty and "SKU" in df_out.columns and "QTY" in df_out.columns:
             df_out["SKU"] = df_out["SKU"].astype(str).str.strip()
-            out_sum = df_out.groupby("SKU")["QTY"].sum().reset_index().rename(columns={"QTY":"總出庫"})
+            df_out["QTY"] = pd.to_numeric(df_out["QTY"], errors='coerce').fillna(0)
+            out_sum = df_out.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"})
         else: out_sum = pd.DataFrame(columns=["SKU","總出庫"])
-        df_stock = pd.merge(df_m, in_sum, on="SKU", how="left")
+
+        df_stock = df_m.copy()
+        df_stock = pd.merge(df_stock, in_sum, on="SKU", how="left")
         df_stock = pd.merge(df_stock, out_sum, on="SKU", how="left")
         df_stock["總入庫"] = pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
         df_stock["總出庫"] = pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
         df_stock["現有庫存"] = df_stock["總入庫"] - df_stock["總出庫"]
         df_stock["最後更新"] = now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
+
         cols = ["SKU","Desc.","Code","UOM","總入庫","總出庫","現有庫存","最後更新"]
         for c in cols:
             if c not in df_stock.columns: df_stock[c]=""
-        df_stock = df_stock[cols].fillna("").astype(str)
+        df_stock = df_stock[cols].fillna("")
+
         try: ws = get_sh().worksheet("Stock")
         except:
             get_sh().add_worksheet(title="Stock", rows=1000, cols=20)
             ws = get_sh().worksheet("Stock")
         ws.clear()
-        ws.update([df_stock.columns.tolist()] + df_stock.values.tolist(), value_input_option='USER_ENTERED')
+        ws.update([df_stock.columns.tolist()] + df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"Stock error: {e}")
 
 def update_stock_mfd_sheet():
@@ -73,15 +79,20 @@ def update_stock_mfd_sheet():
         if df_m.empty: return
         df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
         master_map = df_m.set_index("SKU")[["Desc.","Code"]].to_dict('index')
+
         def clean_mfd(df):
-            if df.empty or "MFD" not in df.columns or "SKU" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+            if df.empty or "MFD" not in df.columns or "SKU" not in df.columns:
+                return pd.DataFrame(columns=["SKU","MFD","QTY"])
             df["SKU"] = df["SKU"].astype(str).str.strip()
-            df["MFD"] = df["MFD"].astype(str).str.strip().replace({"": "無MFD", "None": "無MFD", "nan": "無MFD"})
+            df["MFD"] = df["MFD"].astype(str).str.strip()
+            df["MFD"] = df["MFD"].replace({"": "無MFD", "None": "無MFD", "nan": "無MFD", "NaT": "無MFD"})
             df["QTY"] = pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
             return df[["SKU","MFD","QTY"]]
+
         df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
-        in_mfd = df_in_c.groupby(["SKU","MFD"])["QTY"].sum().reset_index().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
-        out_mfd = df_out_c.groupby(["SKU","MFD"])["QTY"].sum().reset_index().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
+        in_mfd = df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
+        out_mfd = df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
+
         df_mfd_stock = pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer")
         df_mfd_stock["總入庫"] = pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
         df_mfd_stock["總出庫"] = pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
@@ -89,13 +100,14 @@ def update_stock_mfd_sheet():
         df_mfd_stock["Desc."] = df_mfd_stock["SKU"].map(lambda x: master_map.get(x, {}).get("Desc.",""))
         df_mfd_stock["Code"] = df_mfd_stock["SKU"].map(lambda x: master_map.get(x, {}).get("Code",""))
         df_mfd_stock["最後更新"] = now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
-        df_mfd_stock = df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存","最後更新"]].sort_values(["SKU","MFD"]).fillna("").astype(str)
+        df_mfd_stock = df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存","最後更新"]].sort_values(["SKU","MFD"]).fillna("")
+
         try: ws = get_sh().worksheet("Stock_MFD")
         except:
             get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20)
             ws = get_sh().worksheet("Stock_MFD")
         ws.clear()
-        ws.update([df_mfd_stock.columns.tolist()] + df_mfd_stock.values.tolist(), value_input_option='USER_ENTERED')
+        ws.update([df_mfd_stock.columns.tolist()] + df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"Stock_MFD error: {e}")
 
 def append_row(tab, row):
@@ -170,7 +182,6 @@ df_master = load_df("Master")
 sku_list = df_master["SKU"].astype(str).tolist() if not df_master.empty else []
 
 with tab_in:
-    st.subheader("入庫 Receiving")
     col1, col2 = st.columns([1,1])
     with col1:
         st.markdown("**1. 單個入庫**")
@@ -192,7 +203,7 @@ with tab_in:
         f_in = st.file_uploader("上傳入庫Excel/CSV", type=["xlsx","csv"], key="in_bulk_final")
         if f_in:
             df_in = pd.read_csv(f_in) if f_in.name.endswith(".csv") else pd.read_excel(f_in)
-            df_in = df_in.fillna(""); st.dataframe(df_in.head())
+            st.dataframe(df_in.head())
             if st.button("確認批量入庫", key="bulk_in_btn_final"):
                 rows=[]
                 for _, r in df_in.iterrows():
@@ -200,7 +211,6 @@ with tab_in:
                 append_rows("Inbound", rows); st.success(f"已批量入庫 {len(rows)} 筆"); st.balloons(); st.rerun()
 
 with tab_out:
-    st.subheader("出庫 Release")
     col1, col2 = st.columns([1,1])
     with col1:
         st.markdown("**1. 單個出庫**")
@@ -222,7 +232,7 @@ with tab_out:
         f_out = st.file_uploader("上傳出庫Excel/CSV", type=["xlsx","csv"], key="out_bulk_final")
         if f_out:
             df_out = pd.read_csv(f_out) if f_out.name.endswith(".csv") else pd.read_excel(f_out)
-            df_out = df_out.fillna(""); st.dataframe(df_out.head())
+            st.dataframe(df_out.head())
             if st.button("確認批量出庫", key="bulk_out_btn_final"):
                 rows=[]
                 for _, r in df_out.iterrows():
@@ -234,20 +244,23 @@ with tab_view:
     df_in = load_df("Inbound"); df_out = load_df("Outbound")
     if not df_in.empty:
         df_in["QTY"] = pd.to_numeric(df_in["QTY"], errors='coerce').fillna(0)
-        in_sum = df_in.groupby(df_in["SKU"].astype(str))["QTY"].sum().reset_index().rename(columns={"QTY":"總入庫"})
+        df_in["SKU"] = df_in["SKU"].astype(str).str.strip()
+        in_sum = df_in.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"})
     else: in_sum = pd.DataFrame(columns=["SKU","總入庫"])
     if not df_out.empty:
         df_out["QTY"] = pd.to_numeric(df_out["QTY"], errors='coerce').fillna(0)
-        out_sum = df_out.groupby(df_out["SKU"].astype(str))["QTY"].sum().reset_index().rename(columns={"QTY":"總出庫"})
+        df_out["SKU"] = df_out["SKU"].astype(str).str.strip()
+        out_sum = df_out.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"})
     else: out_sum = pd.DataFrame(columns=["SKU","總出庫"])
-    df_stock = pd.merge(df_master, in_sum, left_on=df_master["SKU"].astype(str), right_on="SKU", how="left")
-    df_stock = df_stock.drop(columns=["SKU_y"], errors='ignore').rename(columns={"SKU_x":"SKU"})
-    df_stock = pd.merge(df_stock, out_sum, left_on=df_stock["SKU"].astype(str), right_on="SKU", how="left")
-    df_stock = df_stock.drop(columns=["SKU_y"], errors='ignore').rename(columns={"SKU_x":"SKU"})
-    df_stock["總入庫"] = pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
-    df_stock["總出庫"] = pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
-    df_stock["現有庫存"] = df_stock["總入庫"] - df_stock["總出庫"]
-    st.dataframe(df_stock, use_container_width=True)
+
+    df_stock_view = df_master.copy()
+    df_stock_view["SKU"] = df_stock_view["SKU"].astype(str).str.strip()
+    df_stock_view = pd.merge(df_stock_view, in_sum, on="SKU", how="left")
+    df_stock_view = pd.merge(df_stock_view, out_sum, on="SKU", how="left")
+    df_stock_view["總入庫"] = pd.to_numeric(df_stock_view["總入庫"], errors='coerce').fillna(0)
+    df_stock_view["總出庫"] = pd.to_numeric(df_stock_view["總出庫"], errors='coerce').fillna(0)
+    df_stock_view["現有庫存"] = df_stock_view["總入庫"] - df_stock_view["總出庫"]
+    st.dataframe(df_stock_view, use_container_width=True)
 
 with tab_mfd:
     st.subheader("📅 按MFD庫存")
@@ -255,12 +268,12 @@ with tab_mfd:
     def clean_mfd(df):
         if df.empty or "MFD" not in df.columns or "SKU" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
         df["SKU"] = df["SKU"].astype(str).str.strip()
-        df["MFD"] = df["MFD"].astype(str).str.strip().replace({"": "無MFD", "None": "無MFD", "nan": "無MFD"})
+        df["MFD"] = df["MFD"].astype(str).str.strip().replace({"": "無MFD", "None": "無MFD", "nan": "無MFD", "NaT": "無MFD"})
         df["QTY"] = pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
         return df[["SKU","MFD","QTY"]]
     df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
-    in_mfd = df_in_c.groupby(["SKU","MFD"])["QTY"].sum().reset_index().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
-    out_mfd = df_out_c.groupby(["SKU","MFD"])["QTY"].sum().reset_index().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
+    in_mfd = df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
+    out_mfd = df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
     df_mfd_stock = pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer")
     df_mfd_stock["總入庫"] = pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
     df_mfd_stock["總出庫"] = pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
@@ -275,7 +288,7 @@ with tab_mfd:
 
 if role=="admin":
     with tab_preview:
-        st.dataframe(load_df("Stock"), use_container_width=True, height=300)
-        st.dataframe(load_df("Stock_MFD"), use_container_width=True, height=300)
+        st.dataframe(load_df("Stock"), use_container_width=True, height=250)
+        st.dataframe(load_df("Stock_MFD"), use_container_width=True, height=250)
         if st.button("🔄 強制同步全部", key="sync_all"):
             update_stock_sheet(); update_stock_mfd_sheet(); st.cache_data.clear(); st.rerun()
