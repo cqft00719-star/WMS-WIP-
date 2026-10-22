@@ -38,8 +38,31 @@ def load_df(tab):
                 if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
                 rows.append(r[:len(clean_headers)])
         df = pd.DataFrame(rows, columns=clean_headers)
+        # 智能識別欄位，唔理大小寫同空格
+        new_cols = {}
+        for c in df.columns:
+            lc = c.lower().strip()
+            if "sku" in lc: new_cols[c] = "SKU"
+            elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
+            elif "qty" in lc or "quantity" in lc or "數量" in c or "入庫數" in c or "出庫數" in c: new_cols[c] = "QTY"
+        df = df.rename(columns=new_cols)
         return df
-    except: return pd.DataFrame()
+    except Exception as e:
+        print(f"load_df {tab} error {e}")
+        return pd.DataFrame()
+
+def clean_mfd(df):
+    if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "SKU" not in df.columns or "QTY" not in df.columns:
+        return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "MFD" not in df.columns:
+        df["MFD"] = "無MFD"
+    df["SKU"]=df["SKU"].astype(str).str.strip()
+    df=df[df["SKU"]!=""]
+    df["MFD"]=df["MFD"].astype(str).str.strip().replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
+    df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
+    df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+    return df[["SKU","MFD","QTY"]]
 
 def update_stock_sheet():
     try:
@@ -48,19 +71,17 @@ def update_stock_sheet():
         df_in = load_df("Inbound"); df_out = load_df("Outbound")
         df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
         df_m = df_m[df_m["SKU"]!=""]
-        in_sum = df_in.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in.empty and "SKU" in df_in.columns and "QTY" in df_in.columns else pd.DataFrame(columns=["SKU","總入庫"])
-        out_sum = df_out.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out.empty and "SKU" in df_out.columns and "QTY" in df_out.columns else pd.DataFrame(columns=["SKU","總出庫"])
-        if not in_sum.empty:
-            in_sum["SKU"]=in_sum["SKU"].astype(str).str.strip()
-            in_sum["總入庫"]=pd.to_numeric(in_sum["總入庫"].astype(str), errors='coerce').fillna(0)
-        if not out_sum.empty:
-            out_sum["SKU"]=out_sum["SKU"].astype(str).str.strip()
-            out_sum["總出庫"]=pd.to_numeric(out_sum["總出庫"].astype(str), errors='coerce').fillna(0)
+        df_in_c = clean_mfd(df_in)
+        df_out_c = clean_mfd(df_out)
+        in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+        out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
         df_stock = pd.merge(df_m.copy(), in_sum, on="SKU", how="left")
         df_stock = pd.merge(df_stock, out_sum, on="SKU", how="left")
         df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
         df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
         df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
+        # 庫存唔可以係負數，負數代表入庫未同步，修正為0並保留真實數作參考
+        df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
         df_stock["最後更新"]=now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
         cols=["SKU","Desc.","Code","UOM","總入庫","總出庫","現有庫存","最後更新"]
         for c in cols:
@@ -71,7 +92,7 @@ def update_stock_sheet():
             get_sh().add_worksheet(title="Stock", rows=1000, cols=20)
             ws=get_sh().worksheet("Stock")
         ws.clear(); ws.update([df_stock.columns.tolist()]+df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
-    except Exception as e: print(e)
+    except Exception as e: print(f"stock error {e}")
 
 def update_stock_mfd_sheet():
     try:
@@ -81,28 +102,17 @@ def update_stock_mfd_sheet():
         df_m["SKU"]=df_m["SKU"].astype(str).str.strip()
         df_m = df_m[df_m["SKU"]!=""]
         master_map=df_m.set_index("SKU")[["Desc.","Code"]].to_dict('index') if "Desc." in df_m.columns else {}
-        def clean_mfd(df):
-            if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-            if "SKU" not in df.columns or "QTY" not in df.columns:
-                return pd.DataFrame(columns=["SKU","MFD","QTY"])
-            if "MFD" not in df.columns:
-                df["MFD"] = "無MFD"
-            df["SKU"]=df["SKU"].astype(str).str.strip()
-            df=df[df["SKU"]!=""]
-            df["MFD"]=df["MFD"].astype(str).str.strip()
-            df["MFD"]=df["MFD"].replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
-            df["QTY"]=pd.to_numeric(df["QTY"].astype(str).str.strip(), errors='coerce').fillna(0)
-            return df[["SKU","MFD","QTY"]]
         df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
         in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
         out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
         if in_mfd.empty and out_mfd.empty:
             df_mfd_stock=pd.DataFrame(columns=["SKU","MFD","總入庫","總出庫","現有庫存"])
         else:
-            df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer")
+            df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer").fillna(0)
         df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
         df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
         df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
+        df_mfd_stock["現有庫存"]=df_mfd_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
         df_mfd_stock["Desc."]=df_mfd_stock["SKU"].map(lambda x: master_map.get(x, {}).get("Desc.",""))
         df_mfd_stock["Code"]=df_mfd_stock["SKU"].map(lambda x: master_map.get(x, {}).get("Code",""))
         df_mfd_stock["最後更新"]=now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
@@ -254,14 +264,9 @@ with tab_view:
         st.info("Master未有資料，無法顯示庫存")
     else:
         df_in=load_df("Inbound"); df_out=load_df("Outbound")
-        in_sum=df_in.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in.empty and "SKU" in df_in.columns and "QTY" in df_in.columns else pd.DataFrame(columns=["SKU","總入庫"])
-        out_sum=df_out.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out.empty and "SKU" in df_out.columns and "QTY" in df_out.columns else pd.DataFrame(columns=["SKU","總出庫"])
-        if not in_sum.empty: 
-            in_sum["SKU"]=in_sum["SKU"].astype(str).str.strip()
-            in_sum["總入庫"]=pd.to_numeric(in_sum["總入庫"].astype(str), errors='coerce').fillna(0)
-        if not out_sum.empty:
-            out_sum["SKU"]=out_sum["SKU"].astype(str).str.strip()
-            out_sum["總出庫"]=pd.to_numeric(out_sum["總出庫"].astype(str), errors='coerce').fillna(0)
+        df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
+        in_sum=df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+        out_sum=df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
         df_stock_view=df_master.copy()
         df_stock_view["SKU"]=df_stock_view["SKU"].astype(str).str.strip()
         df_stock_view=pd.merge(df_stock_view, in_sum, on="SKU", how="left")
@@ -269,50 +274,34 @@ with tab_view:
         df_stock_view["總入庫"]=pd.to_numeric(df_stock_view["總入庫"], errors='coerce').fillna(0)
         df_stock_view["總出庫"]=pd.to_numeric(df_stock_view["總出庫"], errors='coerce').fillna(0)
         df_stock_view["現有庫存"]=df_stock_view["總入庫"]-df_stock_view["總出庫"]
+        # 保證唔負數
+        df_stock_view["現有庫存"]=df_stock_view["現有庫存"].apply(lambda x: x if x>=0 else 0)
         st.dataframe(df_stock_view, use_container_width=True)
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存 - 修復版")
+    st.subheader("📅 按MFD庫存 - 已修復")
     if df_master.empty or "SKU" not in df_master.columns:
         st.info("Master未有資料")
     else:
         df_in=load_df("Inbound"); df_out=load_df("Outbound")
-        if df_in.empty and df_out.empty:
-            st.warning("Inbound/Outbound 未有資料，請先入庫")
+        df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
+        in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
+        out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
+        if in_mfd.empty and out_mfd.empty:
+            st.info("未有入出庫MFD紀錄")
         else:
-            def clean_mfd(df):
-                if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-                if "SKU" not in df.columns or "QTY" not in df.columns:
-                    return pd.DataFrame(columns=["SKU","MFD","QTY"])
-                if "MFD" not in df.columns:
-                    df["MFD"] = "無MFD"
-                df["SKU"]=df["SKU"].astype(str).str.strip()
-                df=df[df["SKU"]!=""]
-                df["MFD"]=df["MFD"].astype(str).str.strip()
-                df["MFD"]=df["MFD"].replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
-                df["QTY"]=pd.to_numeric(df["QTY"].astype(str).str.strip(), errors='coerce').fillna(0)
-                return df[["SKU","MFD","QTY"]]
-            df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
-            in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
-            out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
-            if in_mfd.empty and out_mfd.empty:
-                st.info("未有入出庫MFD紀錄")
-            else:
-                df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer").fillna(0)
-                df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
-                df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
-                df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
-                df_mfd_stock=pd.merge(df_mfd_stock, df_master[["SKU","Desc.","Code"]], on="SKU", how="left")
-                df_mfd_stock=df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存"]]
-                c1,c2=st.columns([2,1])
-                sku_filter=c1.selectbox("篩選SKU", ["全部"]+sorted(df_mfd_stock["SKU"].astype(str).unique().tolist()), key="mfd_sku_filter_v2")
-                show_zero=c2.checkbox("顯示0庫存", value=False)
-                view=df_mfd_stock.copy()
-                if sku_filter!="全部": view=view[view["SKU"]==sku_filter]
-                if not show_zero: view=view[view["現有庫存"]!=0]
-                if view.empty:
-                    st.warning(f"篩選後無資料 (全部{len(df_mfd_stock)}筆，有庫存{len(df_mfd_stock[df_mfd_stock['現有庫存']!=0])}筆)")
-                    st.dataframe(df_mfd_stock, use_container_width=True, height=500)
-                else:
-                    st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆)")
-                    st.dataframe(view, use_container_width=True, height=500)
+            df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer").fillna(0)
+            df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
+            df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
+            df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
+            df_mfd_stock["現有庫存"]=df_mfd_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+            df_mfd_stock=pd.merge(df_mfd_stock, df_master[["SKU","Desc.","Code"]], on="SKU", how="left")
+            df_mfd_stock=df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存"]]
+            c1,c2=st.columns([2,1])
+            sku_filter=c1.selectbox("篩選SKU", ["全部"]+sorted(df_mfd_stock["SKU"].astype(str).unique().tolist()), key="mfd_sku_filter_final")
+            show_zero=c2.checkbox("顯示0庫存", value=False)
+            view=df_mfd_stock.copy()
+            if sku_filter!="全部": view=view[view["SKU"]==sku_filter]
+            if not show_zero: view=view[view["現有庫存"]!=0]
+            st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆)")
+            st.dataframe(view, use_container_width=True, height=500)
