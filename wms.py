@@ -26,7 +26,10 @@ def load_df(tab):
         ws = get_sh().worksheet(tab)
         data = ws.get_all_records()
         if not data: return pd.DataFrame()
-        return pd.DataFrame(data)
+        df = pd.DataFrame(data)
+        # 統一欄位名去空格
+        df.columns = [str(c).strip() for c in df.columns]
+        return df
     except: return pd.DataFrame()
 
 def update_stock_sheet():
@@ -68,15 +71,24 @@ def update_stock_mfd_sheet():
         df_m["SKU"]=df_m["SKU"].astype(str).str.strip()
         master_map=df_m.set_index("SKU")[["Desc.","Code"]].to_dict('index') if "Desc." in df_m.columns else {}
         def clean_mfd(df):
-            if df.empty or "MFD" not in df.columns or "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+            if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+            # 兼容欄位名大小寫
+            col_map = {c.lower(): c for c in df.columns}
+            if "sku" not in col_map or "mfd" not in col_map or "qty" not in col_map:
+                return pd.DataFrame(columns=["SKU","MFD","QTY"])
+            df = df.rename(columns={col_map["sku"]:"SKU", col_map["mfd"]:"MFD", col_map["qty"]:"QTY"})
             df["SKU"]=df["SKU"].astype(str).str.strip()
-            df["MFD"]=df["MFD"].astype(str).str.strip().replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD"})
+            df["MFD"]=df["MFD"].astype(str).str.strip()
+            df["MFD"]=df["MFD"].replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
             df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
             return df[["SKU","MFD","QTY"]]
         df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
         in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
         out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
-        df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer")
+        if in_mfd.empty and out_mfd.empty:
+            df_mfd_stock=pd.DataFrame(columns=["SKU","MFD","總入庫","總出庫","現有庫存"])
+        else:
+            df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer")
         df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
         df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
         df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
@@ -89,7 +101,7 @@ def update_stock_mfd_sheet():
             get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20)
             ws=get_sh().worksheet("Stock_MFD")
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
-    except Exception as e: print(e)
+    except Exception as e: print(f"MFD sync error: {e}")
 
 def append_row(tab, row):
     get_sh().worksheet(tab).append_row(row, value_input_option='USER_ENTERED')
@@ -243,33 +255,49 @@ with tab_view:
         st.dataframe(df_stock_view, use_container_width=True)
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存")
+    st.subheader("📅 按MFD庫存 - 修復版")
     if df_master.empty or "SKU" not in df_master.columns:
         st.info("Master未有資料")
     else:
         df_in=load_df("Inbound"); df_out=load_df("Outbound")
-        def clean_mfd(df):
-            if df.empty or "MFD" not in df.columns or "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-            df["SKU"]=df["SKU"].astype(str).str.strip()
-            df["MFD"]=df["MFD"].astype(str).str.strip().replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD"})
-            df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
-            return df[["SKU","MFD","QTY"]]
-        df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
-        in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
-        out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
-        df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer")
-        df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
-        df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
-        df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
-        if not df_mfd_stock.empty and "SKU" in df_master.columns:
-            df_mfd_stock=pd.merge(df_mfd_stock, df_master[["SKU","Desc.","Code"]], on="SKU", how="left")
-            df_mfd_stock=df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存"]]
-            sku_filter=st.selectbox("篩選SKU", ["全部"]+sorted(df_mfd_stock["SKU"].astype(str).unique().tolist()), key="mfd_sku_filter")
-            view=df_mfd_stock.copy()
-            if sku_filter!="全部": view=view[view["SKU"]==sku_filter]
-            view=view[view["現有庫存"]>0]
-            st.dataframe(view, use_container_width=True, height=500)
-        else: st.info("未有入出庫MFD紀錄")
+        if df_in.empty and df_out.empty:
+            st.warning("Inbound/Outbound 未有資料，請先入庫")
+        else:
+            def clean_mfd(df):
+                if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+                col_map = {c.lower(): c for c in df.columns}
+                if "sku" not in col_map or "mfd" not in col_map or "qty" not in col_map:
+                    return pd.DataFrame(columns=["SKU","MFD","QTY"])
+                df = df.rename(columns={col_map["sku"]:"SKU", col_map["mfd"]:"MFD", col_map["qty"]:"QTY"})
+                df["SKU"]=df["SKU"].astype(str).str.strip()
+                df["MFD"]=df["MFD"].astype(str).str.strip().replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD"})
+                df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+                return df[["SKU","MFD","QTY"]]
+            df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
+            in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
+            out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
+            if in_mfd.empty and out_mfd.empty:
+                st.info("未有入出庫MFD紀錄")
+                df_mfd_stock=pd.DataFrame()
+            else:
+                df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer").fillna(0)
+                df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
+                df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
+                df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
+                df_mfd_stock=pd.merge(df_mfd_stock, df_master[["SKU","Desc.","Code"]], on="SKU", how="left")
+                df_mfd_stock=df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存"]]
+                c1,c2=st.columns([2,1])
+                sku_filter=c1.selectbox("篩選SKU", ["全部"]+sorted(df_mfd_stock["SKU"].astype(str).unique().tolist()), key="mfd_sku_filter_v2")
+                show_zero=c2.checkbox("顯示0庫存", value=False)
+                view=df_mfd_stock.copy()
+                if sku_filter!="全部": view=view[view["SKU"]==sku_filter]
+                if not show_zero: view=view[view["現有庫存"]!=0]
+                if view.empty:
+                    st.warning(f"篩選後無資料 (全部{len(df_mfd_stock)}筆，有庫存{len(df_mfd_stock[df_mfd_stock['現有庫存']!=0])}筆)")
+                    st.dataframe(df_mfd_stock, use_container_width=True, height=500)
+                else:
+                    st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆)")
+                    st.dataframe(view, use_container_width=True, height=500)
 
 if role=="admin":
     with tab_preview:
