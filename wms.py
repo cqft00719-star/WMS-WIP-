@@ -149,7 +149,7 @@ else:
     sku_list=df_master["SKU"].tolist()
 
 if role=="admin":
-    tabs=st.tabs(["SKU Master管理","Master批量","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存","Sheet預覽"])
+    tabs=st.tabs(["SKU Master管理","Master批量","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存"])
     tab_master, tab_bulk_master, tab_in, tab_out, tab_view, tab_mfd, tab_preview=tabs
 else:
     tabs=st.tabs(["入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存"])
