@@ -27,7 +27,6 @@ def load_df(tab):
         data = ws.get_all_records()
         if not data: return pd.DataFrame()
         df = pd.DataFrame(data)
-        # 統一欄位名去空格
         df.columns = [str(c).strip() for c in df.columns]
         return df
     except: return pd.DataFrame()
@@ -72,7 +71,6 @@ def update_stock_mfd_sheet():
         master_map=df_m.set_index("SKU")[["Desc.","Code"]].to_dict('index') if "Desc." in df_m.columns else {}
         def clean_mfd(df):
             if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-            # 兼容欄位名大小寫
             col_map = {c.lower(): c for c in df.columns}
             if "sku" not in col_map or "mfd" not in col_map or "qty" not in col_map:
                 return pd.DataFrame(columns=["SKU","MFD","QTY"])
@@ -150,7 +148,7 @@ else:
 
 if role=="admin":
     tabs=st.tabs(["SKU Master管理","Master批量","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存"])
-    tab_master, tab_bulk_master, tab_in, tab_out, tab_view, tab_mfd, tab_preview=tabs
+    tab_master, tab_bulk_master, tab_in, tab_out, tab_view, tab_mfd=tabs
 else:
     tabs=st.tabs(["入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存"])
     tab_in, tab_out, tab_view, tab_mfd=tabs
@@ -278,7 +276,6 @@ with tab_mfd:
             out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
             if in_mfd.empty and out_mfd.empty:
                 st.info("未有入出庫MFD紀錄")
-                df_mfd_stock=pd.DataFrame()
             else:
                 df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer").fillna(0)
                 df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
@@ -298,10 +295,3 @@ with tab_mfd:
                 else:
                     st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆)")
                     st.dataframe(view, use_container_width=True, height=500)
-
-if role=="admin":
-    with tab_preview:
-        st.write("Stock"); st.dataframe(load_df("Stock"), use_container_width=True, height=250)
-        st.write("Stock_MFD"); st.dataframe(load_df("Stock_MFD"), use_container_width=True, height=250)
-        if st.button("🔄 強制同步全部", key="sync_all"):
-            update_stock_sheet(); update_stock_mfd_sheet(); st.cache_data.clear(); st.rerun()
