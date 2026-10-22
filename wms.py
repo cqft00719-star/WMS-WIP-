@@ -38,13 +38,12 @@ def load_df(tab):
                 if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
                 rows.append(r[:len(clean_headers)])
         df = pd.DataFrame(rows, columns=clean_headers)
-        # 智能識別欄位，唔理大小寫同空格
         new_cols = {}
         for c in df.columns:
             lc = c.lower().strip()
             if "sku" in lc: new_cols[c] = "SKU"
             elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
-            elif "qty" in lc or "quantity" in lc or "數量" in c or "入庫數" in c or "出庫數" in c: new_cols[c] = "QTY"
+            elif "qty" in lc or "quantity" in lc or "數量" in c: new_cols[c] = "QTY"
         df = df.rename(columns=new_cols)
         return df
     except Exception as e:
@@ -80,7 +79,6 @@ def update_stock_sheet():
         df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
         df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
         df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
-        # 庫存唔可以係負數，負數代表入庫未同步，修正為0並保留真實數作參考
         df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
         df_stock["最後更新"]=now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
         cols=["SKU","Desc.","Code","UOM","總入庫","總出庫","現有庫存","最後更新"]
@@ -158,6 +156,14 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
+if role=="admin":
+    if st.sidebar.button("🔄 強制同步Google Sheet庫存", key="force_sync_sheet"):
+        with st.spinner("同步緊..."):
+            st.cache_data.clear()
+            update_stock_sheet()
+            update_stock_mfd_sheet()
+        st.sidebar.success("Google Sheet已同步，正數晒")
+        st.rerun()
 if st.sidebar.button("登出", key="logout_btn_final_v2"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 st.title("WMS 永久版 - 香港時間")
 
@@ -274,7 +280,6 @@ with tab_view:
         df_stock_view["總入庫"]=pd.to_numeric(df_stock_view["總入庫"], errors='coerce').fillna(0)
         df_stock_view["總出庫"]=pd.to_numeric(df_stock_view["總出庫"], errors='coerce').fillna(0)
         df_stock_view["現有庫存"]=df_stock_view["總入庫"]-df_stock_view["總出庫"]
-        # 保證唔負數
         df_stock_view["現有庫存"]=df_stock_view["現有庫存"].apply(lambda x: x if x>=0 else 0)
         st.dataframe(df_stock_view, use_container_width=True)
 
