@@ -24,10 +24,20 @@ def get_sh():
 def load_df(tab):
     try:
         ws = get_sh().worksheet(tab)
-        data = ws.get_all_records()
-        if not data: return pd.DataFrame()
-        df = pd.DataFrame(data)
-        df.columns = [str(c).strip() for c in df.columns]
+        vals = ws.get_all_values()
+        if len(vals) < 1: return pd.DataFrame()
+        headers = [str(h).strip() for h in vals[0]]
+        clean_headers = []
+        for i,h in enumerate(headers):
+            if h == "": h = f"COL_{i}"
+            if h in clean_headers: h = f"{h}_{i}"
+            clean_headers.append(h)
+        rows = []
+        for r in vals[1:]:
+            if any(str(c).strip() != "" for c in r):
+                if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
+                rows.append(r[:len(clean_headers)])
+        df = pd.DataFrame(rows, columns=clean_headers)
         return df
     except: return pd.DataFrame()
 
@@ -37,14 +47,15 @@ def update_stock_sheet():
         if df_m.empty or "SKU" not in df_m.columns: return
         df_in = load_df("Inbound"); df_out = load_df("Outbound")
         df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
+        df_m = df_m[df_m["SKU"]!=""]
         in_sum = df_in.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in.empty and "SKU" in df_in.columns and "QTY" in df_in.columns else pd.DataFrame(columns=["SKU","總入庫"])
         out_sum = df_out.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out.empty and "SKU" in df_out.columns and "QTY" in df_out.columns else pd.DataFrame(columns=["SKU","總出庫"])
         if not in_sum.empty:
             in_sum["SKU"]=in_sum["SKU"].astype(str).str.strip()
-            in_sum["總入庫"]=pd.to_numeric(in_sum["總入庫"], errors='coerce').fillna(0)
+            in_sum["總入庫"]=pd.to_numeric(in_sum["總入庫"].astype(str), errors='coerce').fillna(0)
         if not out_sum.empty:
             out_sum["SKU"]=out_sum["SKU"].astype(str).str.strip()
-            out_sum["總出庫"]=pd.to_numeric(out_sum["總出庫"], errors='coerce').fillna(0)
+            out_sum["總出庫"]=pd.to_numeric(out_sum["總出庫"].astype(str), errors='coerce').fillna(0)
         df_stock = pd.merge(df_m.copy(), in_sum, on="SKU", how="left")
         df_stock = pd.merge(df_stock, out_sum, on="SKU", how="left")
         df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
@@ -68,17 +79,19 @@ def update_stock_mfd_sheet():
         if df_m.empty or "SKU" not in df_m.columns: return
         df_in=load_df("Inbound"); df_out=load_df("Outbound")
         df_m["SKU"]=df_m["SKU"].astype(str).str.strip()
+        df_m = df_m[df_m["SKU"]!=""]
         master_map=df_m.set_index("SKU")[["Desc.","Code"]].to_dict('index') if "Desc." in df_m.columns else {}
         def clean_mfd(df):
             if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-            col_map = {c.lower(): c for c in df.columns}
-            if "sku" not in col_map or "mfd" not in col_map or "qty" not in col_map:
+            if "SKU" not in df.columns or "QTY" not in df.columns:
                 return pd.DataFrame(columns=["SKU","MFD","QTY"])
-            df = df.rename(columns={col_map["sku"]:"SKU", col_map["mfd"]:"MFD", col_map["qty"]:"QTY"})
+            if "MFD" not in df.columns:
+                df["MFD"] = "無MFD"
             df["SKU"]=df["SKU"].astype(str).str.strip()
+            df=df[df["SKU"]!=""]
             df["MFD"]=df["MFD"].astype(str).str.strip()
             df["MFD"]=df["MFD"].replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
-            df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+            df["QTY"]=pd.to_numeric(df["QTY"].astype(str).str.strip(), errors='coerce').fillna(0)
             return df[["SKU","MFD","QTY"]]
         df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
         in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
@@ -144,6 +157,7 @@ if df_master.empty or "SKU" not in df_master.columns:
     sku_list=[]
 else:
     df_master["SKU"]=df_master["SKU"].astype(str).str.strip()
+    df_master=df_master[df_master["SKU"]!=""]
     sku_list=df_master["SKU"].tolist()
 
 if role=="admin":
@@ -174,6 +188,7 @@ if role=="admin":
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
+sku_list=[s for s in sku_list if str(s).strip()!=""]
 
 with tab_in:
     col1,col2=st.columns([1,1])
@@ -241,8 +256,12 @@ with tab_view:
         df_in=load_df("Inbound"); df_out=load_df("Outbound")
         in_sum=df_in.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in.empty and "SKU" in df_in.columns and "QTY" in df_in.columns else pd.DataFrame(columns=["SKU","總入庫"])
         out_sum=df_out.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out.empty and "SKU" in df_out.columns and "QTY" in df_out.columns else pd.DataFrame(columns=["SKU","總出庫"])
-        if not in_sum.empty: in_sum["SKU"]=in_sum["SKU"].astype(str).str.strip(); in_sum["總入庫"]=pd.to_numeric(in_sum["總入庫"], errors='coerce').fillna(0)
-        if not out_sum.empty: out_sum["SKU"]=out_sum["SKU"].astype(str).str.strip(); out_sum["總出庫"]=pd.to_numeric(out_sum["總出庫"], errors='coerce').fillna(0)
+        if not in_sum.empty: 
+            in_sum["SKU"]=in_sum["SKU"].astype(str).str.strip()
+            in_sum["總入庫"]=pd.to_numeric(in_sum["總入庫"].astype(str), errors='coerce').fillna(0)
+        if not out_sum.empty:
+            out_sum["SKU"]=out_sum["SKU"].astype(str).str.strip()
+            out_sum["總出庫"]=pd.to_numeric(out_sum["總出庫"].astype(str), errors='coerce').fillna(0)
         df_stock_view=df_master.copy()
         df_stock_view["SKU"]=df_stock_view["SKU"].astype(str).str.strip()
         df_stock_view=pd.merge(df_stock_view, in_sum, on="SKU", how="left")
@@ -263,13 +282,15 @@ with tab_mfd:
         else:
             def clean_mfd(df):
                 if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-                col_map = {c.lower(): c for c in df.columns}
-                if "sku" not in col_map or "mfd" not in col_map or "qty" not in col_map:
+                if "SKU" not in df.columns or "QTY" not in df.columns:
                     return pd.DataFrame(columns=["SKU","MFD","QTY"])
-                df = df.rename(columns={col_map["sku"]:"SKU", col_map["mfd"]:"MFD", col_map["qty"]:"QTY"})
+                if "MFD" not in df.columns:
+                    df["MFD"] = "無MFD"
                 df["SKU"]=df["SKU"].astype(str).str.strip()
-                df["MFD"]=df["MFD"].astype(str).str.strip().replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD"})
-                df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+                df=df[df["SKU"]!=""]
+                df["MFD"]=df["MFD"].astype(str).str.strip()
+                df["MFD"]=df["MFD"].replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
+                df["QTY"]=pd.to_numeric(df["QTY"].astype(str).str.strip(), errors='coerce').fillna(0)
                 return df[["SKU","MFD","QTY"]]
             df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
             in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
