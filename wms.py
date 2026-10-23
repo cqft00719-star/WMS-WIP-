@@ -18,31 +18,19 @@ ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
 def send_ultramsg_document(file_path, caption=""):
     try:
-        # 1. 上傳Excel去公網拿URL (UltraMsg document必須用URL)
-        public_url = None
-        # 試 catbox
-        try:
-            with open(file_path, "rb") as f:
-                r_up = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=30)
-                if r_up.status_code == 200 and "http" in r_up.text:
-                    public_url = r_up.text.strip()
-        except Exception as e:
-            print(f"catbox fail {e}")
-        
-        # fallback file.io
-        if not public_url:
-            try:
-                with open(file_path, "rb") as f:
-                    r_up = requests.post("https://file.io", files={"file": f}, timeout=30)
-                    if r_up.status_code == 200:
-                        public_url = r_up.json().get("link")
-            except Exception as e:
-                print(f"file.io fail {e}")
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
 
-        if not public_url:
-            return False, "Upload public URL failed"
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=["https://www.googleapis.com/auth/drive"])
+        drive = build('drive', 'v3', credentials=creds)
 
-        # 2. 用官方格式發
+        file_metadata = {'name': os.path.basename(file_path)}
+        media = MediaFileUpload(file_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        uploaded = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        file_id = uploaded.get('id')
+        drive.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
+        public_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
         payload = {
             "token": ULTRAMSG_TOKEN,
@@ -52,10 +40,18 @@ def send_ultramsg_document(file_path, caption=""):
             "caption": caption
         }
         r = requests.post(url, data=payload, timeout=30)
-        # Debug 顯示喺sidebar，幫你睇真實回應
-        st.sidebar.code(f"UltraMsg: {r.status_code}\n{r.text[:800]}\nURL:{public_url[:120]}")
-        return r.status_code == 200, r.text[:1000]
+        st.sidebar.code(f"Drive: {public_url}\nUltraMsg: {r.status_code}\n{r.text[:800]}")
+        
+        if r.status_code != 200:
+            fallback_text = f"{caption}\n\n📥 下載Excel: {public_url}"
+            url_chat = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat"
+            r2 = requests.post(url_chat, data={"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "body": fallback_text}, timeout=20)
+            return r2.status_code == 200, f"Document fail, sent link: {r2.text[:300]}"
+        
+        return True, r.text[:500]
     except Exception as e:
+        import traceback
+        st.sidebar.code(traceback.format_exc()[:1500])
         return False, str(e)
 
 def get_stock_df_for_export():
@@ -352,7 +348,7 @@ with tab_out:
             if st.button("確認批量出庫", key="bulk_out_btn_final"):
                 rows=[]
                 for _, r in df_out.iterrows():
-                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), str(r.get("SKU","")), str(r.get("UOM","PCS") or "PCS"), operator])
+                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), str(r.get("SKU","")), str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
                 append_rows("Outbound", rows); st.success(f"已批量出庫 {len(rows)} 筆"); st.balloons(); st.rerun()
 
 with tab_view:
