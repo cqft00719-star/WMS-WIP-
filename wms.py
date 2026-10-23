@@ -18,12 +18,43 @@ ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
 def send_ultramsg_document(file_path, caption=""):
     try:
+        # 1. 上傳Excel去公網拿URL (UltraMsg document必須用URL)
+        public_url = None
+        # 試 catbox
+        try:
+            with open(file_path, "rb") as f:
+                r_up = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=30)
+                if r_up.status_code == 200 and "http" in r_up.text:
+                    public_url = r_up.text.strip()
+        except Exception as e:
+            print(f"catbox fail {e}")
+        
+        # fallback file.io
+        if not public_url:
+            try:
+                with open(file_path, "rb") as f:
+                    r_up = requests.post("https://file.io", files={"file": f}, timeout=30)
+                    if r_up.status_code == 200:
+                        public_url = r_up.json().get("link")
+            except Exception as e:
+                print(f"file.io fail {e}")
+
+        if not public_url:
+            return False, "Upload public URL failed"
+
+        # 2. 用官方格式發
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
-        with open(file_path, "rb") as f:
-            files = {"document": f}
-            data = {"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "filename": os.path.basename(file_path), "caption": caption}
-            r = requests.post(url, data=data, files=files, timeout=30)
-            return r.status_code == 200, r.text[:1000]
+        payload = {
+            "token": ULTRAMSG_TOKEN,
+            "to": ULTRAMSG_GROUP_ID,
+            "document": public_url,
+            "filename": os.path.basename(file_path),
+            "caption": caption
+        }
+        r = requests.post(url, data=payload, timeout=30)
+        # Debug 顯示喺sidebar，幫你睇真實回應
+        st.sidebar.code(f"UltraMsg: {r.status_code}\n{r.text[:800]}\nURL:{public_url[:120]}")
+        return r.status_code == 200, r.text[:1000]
     except Exception as e:
         return False, str(e)
 
@@ -48,7 +79,6 @@ def get_stock_df_for_export():
 def generate_stock_excel_for_ultramsg():
     df_stock = get_stock_df_for_export()
     if df_stock.empty: return None
-    # 附件唔顯示總入庫同總出庫
     export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
     for c in export_cols:
         if c not in df_stock.columns: df_stock[c]=""
@@ -342,7 +372,6 @@ with tab_view:
         df_stock_view["總出庫"]=pd.to_numeric(df_stock_view["總出庫"], errors='coerce').fillna(0)
         df_stock_view["現有庫存"]=df_stock_view["總入庫"]-df_stock_view["總出庫"]
         df_stock_view["現有庫存"]=df_stock_view["現有庫存"].apply(lambda x: x if x>=0 else 0)
-        # 顯示都唔要總入庫總出庫
         show_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
         for c in show_cols:
             if c not in df_stock_view.columns: df_stock_view[c]=""
