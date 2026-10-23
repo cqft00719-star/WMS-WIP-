@@ -17,38 +17,26 @@ ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
 ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
 def upload_to_public_url(file_path):
-    # 試多個host，Streamlit Cloud封一個仲有另一個
-    hosts = []
-    # 1. 0x0.st
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://0x0.st", files={"file": f}, timeout=20)
-            if r.status_code == 200 and "http" in r.text:
-                return r.text.strip()
-    except: pass
-    # 2. tmpfiles.org
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": f}, timeout=20)
-            if r.status_code == 200:
-                j = r.json()
-                url = j.get("data", {}).get("url")
-                if url:
-                    # tmpfiles要轉直連
-                    return url.replace("tmpfiles.org/dl/", "tmpfiles.org/dl/")  # 原link已可用
-    except: pass
-    # 3. gofile
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://store1.gofile.io/uploadFile", files={"file": f}, timeout=30)
-            if r.status_code == 200 and "downloadPage" in r.text:
-                j = r.json()
-                return j.get("data", {}).get("downloadPage")
-    except: pass
-    # 4. catbox (再試)
+    # 優先用 catbox.moe - 會保留.xlsx尾綴，WhatsApp先認做Excel
     try:
         with open(file_path, "rb") as f:
             r = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=30)
+            if r.status_code == 200 and "http" in r.text:
+                url = r.text.strip()
+                if "catbox" in url:
+                    return url
+    except: pass
+    # litterbox 72h，都保留副檔名
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://litterbox.catbox.moe/resources/internals/api.php", data={"reqtype": "fileupload", "time": "72h"}, files={"fileToUpload": f}, timeout=30)
+            if r.status_code == 200 and "http" in r.text:
+                return r.text.strip()
+    except: pass
+    # 最後 fallback 0x0.st
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://0x0.st", files={"file": f}, timeout=20)
             if r.status_code == 200 and "http" in r.text:
                 return r.text.strip()
     except: pass
@@ -58,19 +46,7 @@ def send_ultramsg_document(file_path, caption=""):
     try:
         public_url = upload_to_public_url(file_path)
         if not public_url:
-            # 最後fallback：直接發Google Sheets入面個Stock分頁嘅export link
-            sh = get_sh()
-            sheet_id = sh.id
-            # 搵Stock個gid
-            try:
-                ws = sh.worksheet("Stock")
-                gid = ws.id
-                public_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx&gid={gid}"
-            except:
-                public_url = None
-        
-        if not public_url:
-            return False, "All upload hosts failed"
+            return False, "Upload failed"
 
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
         payload = {
@@ -84,8 +60,7 @@ def send_ultramsg_document(file_path, caption=""):
         st.sidebar.code(f"PublicURL: {public_url}\nUltraMsg: {r.status_code}\n{r.text[:800]}")
         
         if r.status_code != 200:
-            # fallback發文字link
-            txt = f"{caption}\n\n📥 Excel下載: {public_url}"
+            txt = f"{caption}\n\n📥 Excel: {public_url}"
             r2 = requests.post(f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat", data={"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "body": txt}, timeout=20)
             return r2.status_code == 200, f"Doc fail, sent chat: {r2.text[:300]}"
         return True, r.text[:500]
