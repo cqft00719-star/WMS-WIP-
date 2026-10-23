@@ -4,10 +4,58 @@ import gspread
 from google.oauth2.service_account import Credentials
 import datetime
 import pytz
+import requests
+import os
+import io
 
 HKT = pytz.timezone("Asia/Hong_Kong")
 def now_hk(): return datetime.datetime.now(HKT)
 def today_hk(): return now_hk().date()
+
+ULTRAMSG_INSTANCE = "instance194419"
+ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
+ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
+
+def send_ultramsg_document(file_path, caption=""):
+    try:
+        url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
+        with open(file_path, "rb") as f:
+            files = {"document": f}
+            data = {"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "filename": os.path.basename(file_path), "caption": caption}
+            r = requests.post(url, data=data, files=files, timeout=30)
+            return r.status_code == 200, r.text[:1000]
+    except Exception as e:
+        return False, str(e)
+
+def get_stock_df_for_export():
+    df_m = load_df("Master")
+    if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
+    df_in = load_df("Inbound"); df_out = load_df("Outbound")
+    df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
+    df_m = df_m[df_m["SKU"]!=""]
+    df_in_c = clean_mfd(df_in)
+    df_out_c = clean_mfd(df_out)
+    in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+    out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
+    df_stock = pd.merge(df_m.copy(), in_sum, on="SKU", how="left")
+    df_stock = pd.merge(df_stock, out_sum, on="SKU", how="left")
+    df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
+    df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
+    df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
+    df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+    return df_stock
+
+def generate_stock_excel_for_ultramsg():
+    df_stock = get_stock_df_for_export()
+    if df_stock.empty: return None
+    # 附件唔顯示總入庫同總出庫
+    export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
+    for c in export_cols:
+        if c not in df_stock.columns: df_stock[c]=""
+    export_df = df_stock[export_cols].copy()
+    path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
+    export_df.to_excel(path, index=False)
+    return path, export_df
 
 st.set_page_config(page_title="WMS - Master版", layout="wide")
 
@@ -164,6 +212,19 @@ if role=="admin":
             update_stock_mfd_sheet()
         st.sidebar.success("Google Sheet已同步，正數晒")
         st.rerun()
+    if st.sidebar.button("📦 測試發總庫存去WhatsApp", key="test_wms_excel_new_group"):
+        with st.spinner("生成緊Excel..."):
+            result = generate_stock_excel_for_ultramsg()
+            if not result:
+                st.sidebar.warning("無庫存")
+            else:
+                path, df_exp = result
+                caption = f"📦 WMS每日庫存 {today_hk()} HKT18:00\n總SKU: {len(df_exp)} 項\n(已隱藏總入庫/總出庫，只顯示現有庫存)"
+                ok, info = send_ultramsg_document(path, caption)
+                if ok:
+                    st.sidebar.success(f"✅ 已發去 {ULTRAMSG_GROUP_ID}")
+                else:
+                    st.sidebar.error(f"❌ 發送失敗 {info}")
 if st.sidebar.button("登出", key="logout_btn_final_v2"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 st.title("WMS 永久版 - 香港時間")
 
@@ -261,7 +322,7 @@ with tab_out:
             if st.button("確認批量出庫", key="bulk_out_btn_final"):
                 rows=[]
                 for _, r in df_out.iterrows():
-                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), str(r.get("SKU","")), str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
+                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), str(r.get("SKU","")), str(r.get("UOM","PCS") or "PCS"), operator])
                 append_rows("Outbound", rows); st.success(f"已批量出庫 {len(rows)} 筆"); st.balloons(); st.rerun()
 
 with tab_view:
@@ -281,7 +342,16 @@ with tab_view:
         df_stock_view["總出庫"]=pd.to_numeric(df_stock_view["總出庫"], errors='coerce').fillna(0)
         df_stock_view["現有庫存"]=df_stock_view["總入庫"]-df_stock_view["總出庫"]
         df_stock_view["現有庫存"]=df_stock_view["現有庫存"].apply(lambda x: x if x>=0 else 0)
-        st.dataframe(df_stock_view, use_container_width=True)
+        # 顯示都唔要總入庫總出庫
+        show_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
+        for c in show_cols:
+            if c not in df_stock_view.columns: df_stock_view[c]=""
+        st.dataframe(df_stock_view[show_cols], use_container_width=True)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            df_stock_view[show_cols].to_excel(writer, index=False, sheet_name="Stock")
+        buf.seek(0)
+        st.download_button("📥 下載總庫存Excel (無總入庫/總出庫)", data=buf, file_name=f"WMS_Stock_{today_hk()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_stock_no_inout")
 
 with tab_mfd:
     st.subheader("📅 按MFD庫存 - 已修復")
