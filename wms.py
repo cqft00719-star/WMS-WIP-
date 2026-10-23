@@ -7,6 +7,7 @@ import pytz
 import requests
 import os
 import io
+import base64
 
 HKT = pytz.timezone("Asia/Hong_Kong")
 def now_hk(): return datetime.datetime.now(HKT)
@@ -16,54 +17,22 @@ ULTRAMSG_INSTANCE = "instance194419"
 ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
 ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
-def upload_to_public_url(file_path):
-    # 優先用 catbox.moe - 會保留.xlsx尾綴，WhatsApp先認做Excel
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=30)
-            if r.status_code == 200 and "http" in r.text:
-                url = r.text.strip()
-                if "catbox" in url:
-                    return url
-    except: pass
-    # litterbox 72h，都保留副檔名
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://litterbox.catbox.moe/resources/internals/api.php", data={"reqtype": "fileupload", "time": "72h"}, files={"fileToUpload": f}, timeout=30)
-            if r.status_code == 200 and "http" in r.text:
-                return r.text.strip()
-    except: pass
-    # 最後 fallback 0x0.st
-    try:
-        with open(file_path, "rb") as f:
-            r = requests.post("https://0x0.st", files={"file": f}, timeout=20)
-            if r.status_code == 200 and "http" in r.text:
-                return r.text.strip()
-    except: pass
-    return None
-
 def send_ultramsg_document(file_path, caption=""):
     try:
-        public_url = upload_to_public_url(file_path)
-        if not public_url:
-            return False, "Upload failed"
-
+        with open(file_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
         payload = {
             "token": ULTRAMSG_TOKEN,
             "to": ULTRAMSG_GROUP_ID,
-            "document": public_url,
+            "document": b64,
             "filename": os.path.basename(file_path),
             "caption": caption
         }
-        r = requests.post(url, data=payload, timeout=30)
-        st.sidebar.code(f"PublicURL: {public_url}\nUltraMsg: {r.status_code}\n{r.text[:800]}")
-        
-        if r.status_code != 200:
-            txt = f"{caption}\n\n📥 Excel: {public_url}"
-            r2 = requests.post(f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat", data={"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "body": txt}, timeout=20)
-            return r2.status_code == 200, f"Doc fail, sent chat: {r2.text[:300]}"
-        return True, r.text[:500]
+        r = requests.post(url, data=payload, timeout=60)
+        st.sidebar.code(f"Base64 Len: {len(b64)}\nUltraMsg: {r.status_code}\n{r.text[:1000]}")
+        return r.status_code == 200, r.text[:1000]
     except Exception as e:
         import traceback
         st.sidebar.code(traceback.format_exc()[:1500])
