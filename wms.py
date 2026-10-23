@@ -8,6 +8,7 @@ import requests
 import os
 import io
 import base64
+import re
 
 HKT = pytz.timezone("Asia/Hong_Kong")
 def now_hk(): return datetime.datetime.now(HKT)
@@ -21,7 +22,6 @@ def send_ultramsg_document(file_path, caption=""):
     try:
         with open(file_path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode("utf-8")
-        
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
         payload = {
             "token": ULTRAMSG_TOKEN,
@@ -108,6 +108,36 @@ def load_df(tab):
         print(f"load_df {tab} error {e}")
         return pd.DataFrame()
 
+# === 核心修復：MFD標準化 ===
+def normalize_mfd_str(s):
+    s = str(s).strip()
+    if s.lower() in ["","none","nan","nat","無mfd","無MFD"]:
+        return "無MFD"
+    # 試多種日期格式
+    for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d","%d-%m-%Y","%d.%m.%Y","%Y.%m.%d"):
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            return dt.strftime("%d/%m/%Y")
+        except:
+            pass
+    # 處理 9/10/2026 -> 09/10/2026
+    try:
+        # 用dateutil風格，手動split
+        parts = re.split(r'[/\-\.]', s)
+        if len(parts)==3:
+            # 判斷邊個係年
+            if len(parts[2])==4:
+                d=int(parts[0]); m=int(parts[1]); y=int(parts[2])
+            elif len(parts[0])==4:
+                y=int(parts[0]); m=int(parts[1]); d=int(parts[2])
+            else:
+                d=int(parts[0]); m=int(parts[1]); y=int(parts[2])
+            dt = datetime.datetime(y,m,d)
+            return dt.strftime("%d/%m/%Y")
+    except:
+        pass
+    return s
+
 def clean_mfd(df):
     if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
     if "SKU" not in df.columns or "QTY" not in df.columns:
@@ -116,7 +146,7 @@ def clean_mfd(df):
         df["MFD"] = "無MFD"
     df["SKU"]=df["SKU"].astype(str).str.strip()
     df=df[df["SKU"]!=""]
-    df["MFD"]=df["MFD"].astype(str).str.strip().replace({"":"無MFD","None":"無MFD","nan":"無MFD","NaT":"無MFD","NAT":"無MFD"})
+    df["MFD"]=df["MFD"].astype(str).apply(normalize_mfd_str)
     df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
     df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
     return df[["SKU","MFD","QTY"]]
@@ -363,7 +393,7 @@ with tab_view:
         st.download_button("📥 下載總庫存Excel (無總入庫/總出庫)", data=buf, file_name=f"WMS_Stock_{today_hk()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_stock_no_inout")
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存 - 已修復")
+    st.subheader("📅 按MFD庫存 - 已修復MFD格式統一")
     if df_master.empty or "SKU" not in df_master.columns:
         st.info("Master未有資料")
     else:
@@ -387,5 +417,5 @@ with tab_mfd:
             view=df_mfd_stock.copy()
             if sku_filter!="全部": view=view[view["SKU"]==sku_filter]
             if not show_zero: view=view[view["現有庫存"]!=0]
-            st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆)")
+            st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆) - 已按MFD標準化合併")
             st.dataframe(view, use_container_width=True, height=500)
