@@ -16,20 +16,61 @@ ULTRAMSG_INSTANCE = "instance194419"
 ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
 ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
+def upload_to_public_url(file_path):
+    # 試多個host，Streamlit Cloud封一個仲有另一個
+    hosts = []
+    # 1. 0x0.st
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://0x0.st", files={"file": f}, timeout=20)
+            if r.status_code == 200 and "http" in r.text:
+                return r.text.strip()
+    except: pass
+    # 2. tmpfiles.org
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://tmpfiles.org/api/v1/upload", files={"file": f}, timeout=20)
+            if r.status_code == 200:
+                j = r.json()
+                url = j.get("data", {}).get("url")
+                if url:
+                    # tmpfiles要轉直連
+                    return url.replace("tmpfiles.org/dl/", "tmpfiles.org/dl/")  # 原link已可用
+    except: pass
+    # 3. gofile
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://store1.gofile.io/uploadFile", files={"file": f}, timeout=30)
+            if r.status_code == 200 and "downloadPage" in r.text:
+                j = r.json()
+                return j.get("data", {}).get("downloadPage")
+    except: pass
+    # 4. catbox (再試)
+    try:
+        with open(file_path, "rb") as f:
+            r = requests.post("https://catbox.moe/user/api.php", data={"reqtype": "fileupload"}, files={"fileToUpload": f}, timeout=30)
+            if r.status_code == 200 and "http" in r.text:
+                return r.text.strip()
+    except: pass
+    return None
+
 def send_ultramsg_document(file_path, caption=""):
     try:
-        from googleapiclient.discovery import build
-        from googleapiclient.http import MediaFileUpload
-
-        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=["https://www.googleapis.com/auth/drive"])
-        drive = build('drive', 'v3', credentials=creds)
-
-        file_metadata = {'name': os.path.basename(file_path)}
-        media = MediaFileUpload(file_path, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        uploaded = drive.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        file_id = uploaded.get('id')
-        drive.permissions().create(fileId=file_id, body={'type': 'anyone', 'role': 'reader'}).execute()
-        public_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        public_url = upload_to_public_url(file_path)
+        if not public_url:
+            # 最後fallback：直接發Google Sheets入面個Stock分頁嘅export link
+            sh = get_sh()
+            sheet_id = sh.id
+            # 搵Stock個gid
+            try:
+                ws = sh.worksheet("Stock")
+                gid = ws.id
+                public_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx&gid={gid}"
+            except:
+                public_url = None
+        
+        if not public_url:
+            return False, "All upload hosts failed"
 
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
         payload = {
@@ -40,14 +81,13 @@ def send_ultramsg_document(file_path, caption=""):
             "caption": caption
         }
         r = requests.post(url, data=payload, timeout=30)
-        st.sidebar.code(f"Drive: {public_url}\nUltraMsg: {r.status_code}\n{r.text[:800]}")
+        st.sidebar.code(f"PublicURL: {public_url}\nUltraMsg: {r.status_code}\n{r.text[:800]}")
         
         if r.status_code != 200:
-            fallback_text = f"{caption}\n\n📥 下載Excel: {public_url}"
-            url_chat = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat"
-            r2 = requests.post(url_chat, data={"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "body": fallback_text}, timeout=20)
-            return r2.status_code == 200, f"Document fail, sent link: {r2.text[:300]}"
-        
+            # fallback發文字link
+            txt = f"{caption}\n\n📥 Excel下載: {public_url}"
+            r2 = requests.post(f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat", data={"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "body": txt}, timeout=20)
+            return r2.status_code == 200, f"Doc fail, sent chat: {r2.text[:300]}"
         return True, r.text[:500]
     except Exception as e:
         import traceback
