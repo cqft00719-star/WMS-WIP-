@@ -9,6 +9,10 @@ import os
 import io
 import base64
 import re
+import uuid
+import time
+import difflib
+from PIL import Image, ImageOps
 
 HKT = pytz.timezone("Asia/Hong_Kong")
 def now_hk(): return datetime.datetime.now(HKT)
@@ -49,7 +53,141 @@ def send_ultramsg_document(file_path, caption=""):
         st.sidebar.code(traceback.format_exc()[:1500])
         return False, str(e)
 
-st.set_page_config(page_title="WMS - Master版", layout="wide")
+# ========== V47 AI INBOUND CORE ==========
+def compress_inspection_high_quality(uploaded_file):
+    try:
+        img = Image.open(io.BytesIO(uploaded_file.getvalue()))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        for max_side in [1600, 1400, 1200, 1024, 900]:
+            for quality in [85, 75, 65, 55]:
+                buf = io.BytesIO()
+                tmp = img.copy()
+                tmp.thumbnail((max_side, max_side), Image.LANCZOS)
+                tmp.save(buf, format="JPEG", quality=quality, optimize=True)
+                fb = buf.getvalue()
+                if len(fb) <= 48000:
+                    return fb, max_side, quality
+        buf = io.BytesIO()
+        img.thumbnail((800, 800), Image.LANCZOS)
+        img.save(buf, format="JPEG", quality=50, optimize=True)
+        return buf.getvalue(), 800, 50
+    except Exception as e:
+        print(f"compress fail {e}")
+        return None, 0, 0
+
+def ai_parse_inspection_free(image_bytes):
+    result = {
+        "inspection_note": "",
+        "product_code": "",
+        "product_name": "",
+        "lot_no": "",
+        "quantity": 0.0,
+        "accepted": 0.0,
+        "unit": "KG",
+        "date": "",
+        "source_date": "",
+        "handwritten": "",
+        "raw_text": "",
+        "confidence": "low"
+    }
+    try:
+        try:
+            import pytesseract
+            img = Image.open(io.BytesIO(image_bytes))
+            img = ImageOps.exif_transpose(img)
+            gray = img.convert("L")
+            text = pytesseract.image_to_string(gray, lang='eng')
+            result["raw_text"] = text
+        except Exception as e:
+            result["raw_text"] = f"Tesseract未安裝: {e}，請用手動輸入"
+            return result
+
+        text = result["raw_text"]
+        text_upper = text.upper()
+
+        m = re.search(r"IN\d{6,}(?:\s*\(\d+\))?", text_upper)
+        if m:
+            result["inspection_note"] = m.group(0).replace(" ", "").strip()
+
+        m = re.search(r"PRODUCT\s*CODE\s*[:\s]*([A-Z0-9]{4,20})", text_upper)
+        if m:
+            result["product_code"] = m.group(1).strip()
+        else:
+            m2 = re.search(r"SPBMC[A-Z0-9]+", text_upper)
+            if m2:
+                result["product_code"] = m2.group(0)
+
+        m = re.search(r"WIP\s*-\s*[^\n\r]+", text, re.IGNORECASE)
+        if m:
+            result["product_name"] = m.group(0).strip()
+
+        m = re.search(r"LOT\s*NO\.?\s*[:\s]*([A-Z0-9]{5,20})", text_upper)
+        if m:
+            result["lot_no"] = m.group(1).strip()
+        else:
+            m2 = re.search(r"\b\d{6}[A-Z]\b", text_upper)
+            if m2:
+                result["lot_no"] = m2.group(0)
+
+        m = re.search(r"QUANTITY\s*[:\s]*([\d,]+\.\d+)", text_upper)
+        if m:
+            try:
+                result["quantity"] = float(m.group(1).replace(",",""))
+            except: pass
+
+        m = re.search(r"ACCEPTED\s*[:\s]*([\d,]+\.\d+)", text_upper)
+        if m:
+            try:
+                result["accepted"] = float(m.group(1).replace(",",""))
+            except: pass
+
+        m = re.search(r"(\d{1,2}\s+[A-Z]{3}\s+\d{4})", text)
+        if m:
+            result["date"] = m.group(1)
+
+        handwritten_patterns = re.findall(r"(\d+\s*x\s*\d+|\d+\s*差\s*[\d.]+|差\s*[\d.]+)", text)
+        if handwritten_patterns:
+            result["handwritten"] = " / ".join(handwritten_patterns)
+
+        if result["product_code"] and result["inspection_note"]:
+            result["confidence"] = "high"
+        elif result["product_code"]:
+            result["confidence"] = "medium"
+        return result
+    except Exception as e:
+        result["raw_text"] = f"Parse error: {e}"
+        return result
+
+def map_product_code_to_wms_sku(product_code, product_name, df_master):
+    if df_master.empty or "SKU" not in df_master.columns:
+        return None, "Master無SKU"
+    if not product_code:
+        return None, "無Product Code"
+    df_master["SKU_str"] = df_master["SKU"].astype(str).str.strip()
+    df_master = df_master[df_master["SKU_str"]!=""]
+    matches = df_master[df_master["SKU_str"].str.contains(re.escape(product_code), case=False, na=False, regex=True)]
+    if not matches.empty:
+        if len(matches) == 1:
+            return matches.iloc[0].to_dict(), f"✅ 用 {product_code} 直接對應"
+        if product_name:
+            keyword = product_name.split("-")[-1].strip()[:6] if "-" in product_name else product_name[:6]
+            sub = matches[matches["SKU_str"].str.contains(re.escape(keyword), case=False, na=False, regex=True)]
+            if not sub.empty:
+                return sub.iloc[0].to_dict(), f"✅ 用 {product_code}+{keyword} 對應"
+        return matches.iloc[0].to_dict(), f"✅ 用 {product_code} 對應 (搵到{len(matches)}條，取第一條)"
+    if product_name:
+        best = difflib.get_close_matches(product_name, df_master["SKU_str"].tolist(), n=1, cutoff=0.4)
+        if best:
+            row = df_master[df_master["SKU_str"]==best[0]].iloc[0]
+            return row.to_dict(), f"✅ 用名模糊對應 {product_name[:15]}"
+    return None, f"❌ WMS搵唔到 {product_code}，需人手揀"
+
+def sanitize_filename(s):
+    s = re.sub(r'[\\/*?:"<>|]', "_", s)
+    s = s.replace(" ", "_").replace("(", "").replace(")", "")
+    return s[:60]
+
+st.set_page_config(page_title="WMS - V47 AI版", layout="wide")
 
 @st.cache_resource
 def get_client():
@@ -241,13 +379,50 @@ def update_stock_mfd_sheet():
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"MFD sync error: {e}")
 
+def ensure_sheets():
+    sh = get_sh()
+    existing = [ws.title for ws in sh.worksheets()]
+    if "InspectionImages" not in existing:
+        ws = sh.add_worksheet(title="InspectionImages", rows=2000, cols=20)
+        ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","Base64_Image","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
+    if "DailyLog" not in existing:
+        ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
+        ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
+
 def append_row(tab, row):
     get_sh().worksheet(tab).append_row(row, value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
+
+def append_row_safe(tab, row):
+    try:
+        safe_row=[]
+        for c in row:
+            s=str(c)
+            if len(s)>45000:
+                s=s[:45000]+"...[已截斷]"
+            safe_row.append(s)
+        get_sh().worksheet(tab).append_rows([safe_row], value_input_option='USER_ENTERED')
+        st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
+        return True
+    except Exception as e:
+        msg=str(e)
+        if "429" in msg or "Quota" in msg:
+            time.sleep(2.5)
+            try:
+                get_sh().worksheet(tab).append_rows([safe_row], value_input_option='USER_ENTERED')
+                st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
+                return True
+            except Exception as e2:
+                st.error(f"寫入 {tab} 失敗(重試後): {e2}")
+                return False
+        st.error(f"寫入 {tab} 失敗: {e}")
+        return False
+
 def append_rows(tab, rows):
     if rows:
         get_sh().worksheet(tab).append_rows(rows, value_input_option='USER_ENTERED')
         st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
+
 def overwrite_master(df):
     ws=get_sh().worksheet("Master")
     df=df.fillna("")
@@ -259,13 +434,14 @@ def overwrite_master(df):
     ws.clear(); ws.update([df.columns.tolist()]+df.values.tolist(), value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
 
-# 啟動就檢查一次自動發送
-try: check_and_auto_send_wms()
+try: 
+    ensure_sheets()
+    check_and_auto_send_wms()
 except: pass
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS 登入")
+    st.title("WMS V47 登入 - AI版")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -279,8 +455,9 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
+st.sidebar.caption(f"🔥 V47.0 AI入庫 + 慳位高清保存")
 last_log = get_last_daily_log()
-if last_log: st.sidebar.caption(f"今日未自動發送: {last_log} (18:00)")
+if last_log: st.sidebar.caption(f"上次自動發送: {last_log} (18:00)")
 else: st.sidebar.caption(f"今日未自動發送 (18:00)")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步Google Sheet庫存", key="force_sync_sheet"):
@@ -304,7 +481,7 @@ if role=="admin":
         st.sidebar.dataframe(load_df("DailyLog").tail(10))
 if st.sidebar.button("登出", key="logout_btn_final_v2"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS 永久版 - 香港時間")
+st.title("WMS V47 - AI智能入庫版")
 
 df_master=load_df("Master")
 if df_master.empty or "SKU" not in df_master.columns:
@@ -316,11 +493,102 @@ else:
     sku_list=df_master["SKU"].tolist()
 
 if role=="admin":
-    tabs=st.tabs(["SKU Master管理","Master批量","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存"])
-    tab_master, tab_bulk_master, tab_in, tab_out, tab_view, tab_mfd=tabs
+    tabs=st.tabs(["📸 AI智能入庫","SKU Master管理","Master批量","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存","🖼️ 圖片記錄"])
+    tab_ai, tab_master, tab_bulk_master, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 else:
-    tabs=st.tabs(["入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存"])
-    tab_in, tab_out, tab_view, tab_mfd=tabs
+    tabs=st.tabs(["📸 AI智能入庫","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存","🖼️ 圖片記錄"])
+    tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
+
+with tab_ai:
+    st.subheader("📸 AI智能入庫 - 影Inspection Note自動入庫")
+    st.info("💡 支援 Cookies Quartet格式：影相 -> 自動辨識 Product Code / Lot / Qty -> 自動對應WMS SKU -> 用IN號做檔名高清慳位保存")
+    
+    col_up, col_preview = st.columns([1,1])
+    with col_up:
+        ai_files = st.file_uploader("📷 拍照上傳Inspection Note (可多張)", type=["jpg","png","jpeg"], accept_multiple_files=True, key="v47_ai_files")
+        st.caption("提示：盡量影正、光線充足，電腦印字辨識率95%+")
+
+    if ai_files:
+        for idx_file, af in enumerate(ai_files):
+            st.divider()
+            st.markdown(f"#### 📄 文件 {idx_file+1}: {af.name}")
+            c1, c2 = st.columns([1,1])
+            with c1:
+                st.image(af, caption=f"原圖 {af.name}", use_container_width=True)
+                fb, max_side, qual = compress_inspection_high_quality(af)
+                if fb:
+                    st.caption(f"已壓縮: {len(fb)/1024:.1f}KB | {max_side}px | Q{qual} | 原: {len(af.getvalue())/1024:.1f}KB")
+                    with st.spinner("🔍 AI辨識中... (免費版)"):
+                        parsed = ai_parse_inspection_free(fb)
+            with c2:
+                if fb:
+                    st.markdown("**🤖 AI辨識結果**")
+                    st.json(parsed)
+                    if parsed["product_code"]:
+                        sku_info, msg = map_product_code_to_wms_sku(parsed["product_code"], parsed["product_name"], df_master)
+                        st.info(msg)
+                        if sku_info:
+                            st.success(f"對應WMS SKU: {sku_info.get('SKU','')}\nDesc: {sku_info.get('Desc.','')}")
+                    else:
+                        sku_info = None
+                        st.warning("未辨識到Product Code，請手動輸入")
+
+                    with st.form(f"v47_ai_confirm_{idx_file}", clear_on_submit=False):
+                        st.markdown("**✅ 確認入庫資料 (可修改)**")
+                        default_in = parsed["inspection_note"] or f"IN{now_hk().strftime('%m%d%H%M')}"
+                        default_pc = parsed["product_code"]
+                        default_lot = parsed["lot_no"]
+                        default_qty = parsed["quantity"] if parsed["quantity"]>0 else parsed["accepted"] if parsed["accepted"]>0 else 0.0
+                        default_hw = parsed["handwritten"]
+
+                        ins_no = st.text_input("Inspection Note #", value=default_in, key=f"v47_ins_{idx_file}")
+                        if sku_info:
+                            default_sku = sku_info.get("SKU","")
+                            sku_options = [default_sku] + [s for s in sku_list if s != default_sku]
+                        else:
+                            sku_options = [""] + sku_list
+                        
+                        selected_sku = st.selectbox("WMS SKU (自動對應，可改)", sku_options, key=f"v47_sku_{idx_file}")
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            qty_in = st.number_input("入庫數量 QTY", value=float(default_qty), min_value=0.0, step=0.1, key=f"v47_qty_{idx_file}")
+                            mfd_in = st.date_input("MFD (生產日期)", value=None, key=f"v47_mfd_{idx_file}")
+                        with col_b:
+                            lot_in = st.text_input("Lot No / 批次", value=default_lot, key=f"v47_lot_{idx_file}")
+                            uom_in = st.selectbox("UOM", ["KG","PCS","BOX"], key=f"v47_uom_{idx_file}")
+                        
+                        rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"v47_rec_date_{idx_file}")
+                        rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"v47_rec_time_{idx_file}")
+                        hw_note = st.text_input("手寫備註 (如 40x2 差100.8)", value=default_hw, key=f"v47_hw_{idx_file}")
+
+                        submit_ai = st.form_submit_button(f"✅ 確認入庫 + 用 {ins_no} 做檔名保存", type="primary", use_container_width=True)
+
+                        if submit_ai:
+                            if not selected_sku:
+                                st.error("請選擇WMS SKU")
+                            elif qty_in <=0:
+                                st.error("數量要大於0")
+                            else:
+                                safe_ins = sanitize_filename(ins_no)
+                                file_name = f"{safe_ins}_{uuid.uuid4().hex[:4]}.jpg"
+                                b64 = base64.b64encode(fb).decode("utf-8")
+                                data_url = f"data:image/jpeg;base64,{b64}"
+                                ok1 = append_row_safe("InspectionImages", [
+                                    ins_no, parsed["product_code"], lot_in, selected_sku, file_name, str(len(fb)), data_url, str(qty_in), hw_note, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:4000]
+                                ])
+                                full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
+                                mfd_str = mfd_in.strftime("%d/%m/%Y") if mfd_in else lot_in
+                                ok2 = append_row_safe("Inbound", [full_dt, ins_no, mfd_str, selected_sku, str(qty_in), uom_in, operator])
+
+                                if ok1 and ok2:
+                                    st.success(f"🎉 已入庫 {selected_sku} {qty_in}{uom_in}，圖片已用 {file_name} 保存")
+                                    st.balloons()
+                                    st.cache_data.clear()
+                                else:
+                                    st.error("保存失敗，請重試")
+
+    else:
+        st.info("請先上傳Inspection Note相片")
 
 if role=="admin":
     with tab_master:
@@ -431,7 +699,7 @@ with tab_view:
         st.download_button("📥 下載總庫存Excel (無總入庫/總出庫)", data=buf, file_name=f"WMS_Stock_{today_hk()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_stock_no_inout")
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存 - 已修復MFD格式統一")
+    st.subheader("📅 按MFD庫存")
     if df_master.empty or "SKU" not in df_master.columns:
         st.info("Master未有資料")
     else:
@@ -455,5 +723,24 @@ with tab_mfd:
             view=df_mfd_stock.copy()
             if sku_filter!="全部": view=view[view["SKU"]==sku_filter]
             if not show_zero: view=view[view["現有庫存"]!=0]
-            st.success(f"找到 {len(view)} 筆MFD庫存 (總 {len(df_mfd_stock)} 筆) - 已按MFD標準化合併")
             st.dataframe(view, use_container_width=True, height=500)
+
+with tab_images:
+    st.subheader("🖼️ Inspection 圖片記錄 - 用IN號做檔名")
+    df_img = load_df("InspectionImages")
+    if df_img.empty:
+        st.info("暫無AI入庫圖片記錄")
+    else:
+        st.dataframe(df_img[["InspectionNote","WMS_SKU","FileName","QTY","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
+        sel = st.selectbox("選擇一張查看", df_img["InspectionNote"].astype(str).tolist()[:50], key="img_view_sel")
+        if sel:
+            row = df_img[df_img["InspectionNote"].astype(str)==sel].iloc[0]
+            b64 = str(row.get("Base64_Image",""))
+            if b64:
+                if "," in b64:
+                    b64 = b64.split(",",1)[1]
+                try:
+                    img_bytes = base64.b64decode(b64)
+                    st.image(Image.open(io.BytesIO(img_bytes)), caption=f"{row.get('FileName','')} | {row.get('WMS_SKU','')} {row.get('QTY','')} | {row.get('Handwritten','')}", use_container_width=True)
+                except:
+                    st.warning("圖片解碼失敗")
