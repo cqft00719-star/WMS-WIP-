@@ -5,7 +5,6 @@ from google.oauth2.service_account import Credentials
 import datetime
 import pytz
 import requests
-import os
 import io
 import base64
 import re
@@ -52,39 +51,69 @@ def compress_inspection_dual(uploaded_file):
                 if len(fb) <= 48000:
                     return fb_orig, fb, max_side, quality
         return fb_orig, fb_orig, 1600, 90
-    except:
+    except Exception:
         return None, None, 0, 0
 
 def clean_product_code_candidate(raw):
     if not raw:
         return ""
-    s = raw.upper().strip()
-    s = s.replace(" ", "").replace("\n","").replace("\r","")
-    # OCR常見錯： // -> M, / -> , \ -> , | -> I
+    s = raw.upper().strip().replace(" ","").replace("\n","").replace("\r","")
     s = s.replace("//","M").replace("/","").replace("\\","").replace("|","I")
-    # SPBC006 -> SPBMC006, SPBIC006 -> SPBMC006
     s = re.sub(r"SPB[A-Z]?C006", "SPBMC006", s)
     s = re.sub(r"SPB[A-Z]?C00(\d)", r"SPBMC00\1", s)
-    s = re.sub(r"SPBMC0{2,}(\d)", r"SPBMC00\1", s)
-    # SPCQM002 類似修復
     s = re.sub(r"SPCQM0{2,}(\d)", r"SPCQM00\1", s)
+    s = re.sub(r"[^A-Z0-9]", "", s)
     return s
+
+def extract_product_code_robust(text_upper):
+    # 清理 0CT -> OCT
+    fixed = text_upper.replace("0CT","OCT")
+    m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", fixed)
+    if m:
+        cand = clean_product_code_candidate(m.group(1))
+        if cand.startswith("SP") and len(cand)>=7:
+            return cand
+    candidates = re.findall(r"SP[A-Z0-9/\\|]{4,10}", fixed)
+    for c in candidates:
+        cleaned = clean_product_code_candidate(c)
+        if cleaned.startswith("SPBMC") or cleaned.startswith("SPCQM"):
+            if len(cleaned)>=7:
+                return cleaned
+    # 最後兜底
+    if "SPB" in fixed and "006" in fixed:
+        return "SPBMC006"
+    if "SPCQM" in fixed and "002" in fixed:
+        return "SPCQM002"
+    return ""
+
+def extract_inspection_note_robust(text_upper):
+    fixed = text_upper.replace("0CT","OCT").replace(" ","")
+    m = re.search(r"IN26\d{8,10}\(?\d*\)?", fixed)
+    if m:
+        return m.group(0).replace(" ","")
+    m = re.search(r"42\s*61\d{7,10}\(?\d*\)?", text_upper)
+    if m:
+        raw = m.group(0).replace(" ","").replace("42","IN",1)
+        raw = raw.replace("61","26",1) if "IN61" in raw else raw
+        return raw
+    m = re.search(r"26\d{8,10}\(?\d*\)?", fixed)
+    if m:
+        return "IN" + m.group(0)
+    return ""
 
 def ai_parse_inspection_free(image_bytes_high_res):
     result = {"inspection_note": "","product_code": "","product_name": "","lot_no": "","quantity": 0.0,"accepted": 0.0,"unit": "PCS","date": "","mfd": "","handwritten": "","raw_text": "","confidence": "low"}
     text = ""
     try:
         import easyocr
-        import numpy as np
-        import cv2
         reader = easyocr.Reader(['ch_tra','en'], gpu=False, verbose=False)
-        nparr = np.frombuffer(image_bytes_high_res, np.uint8)
-        img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        # V49.1: 加強預處理
-        img_cv = cv2.resize(img_cv, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-        gray = cv2.GaussianBlur(gray, (3,3), 0)
-        ocr_result = reader.readtext(gray, detail=0, paragraph=True)
+        img = Image.open(io.BytesIO(image_bytes_high_res))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        # 放大2倍易認
+        w,h = img.size
+        img = img.resize((w*2, h*2), Image.LANCZOS)
+        # EasyOCR直接讀PIL會自己轉
+        ocr_result = reader.readtext(img, detail=0, paragraph=True)
         text = "\n".join(ocr_result)
         result["raw_text"] = text
     except Exception as e_easy:
@@ -97,106 +126,52 @@ def ai_parse_inspection_free(image_bytes_high_res):
             gray = gray.resize((w*2, h*2), Image.LANCZOS)
             gray = ImageOps.autocontrast(gray, cutoff=2)
             text = pytesseract.image_to_string(gray, lang='chi_tra+eng', config='--psm 6')
-            result["raw_text"] = text
+            result["raw_text"] = text + f"\n[Fallback {e_easy}]"
         except Exception as e:
             result["raw_text"] = f"OCR失敗: {e_easy}/{e}"
             return result
 
     text_upper = text.upper()
-    # V49.1: 修復 0CT -> OCT, 0ct
-    text_upper_fixed = text_upper.replace("0CT","OCT").replace("0 CT","OCT")
+    text_upper_fixed = text_upper.replace("0CT","OCT")
 
-    # 1. Inspection Note - 修復 42 -> IN
-    m = re.search(r"IN26\d{8,10}\s*(?:\(\d+\))?", text_upper_fixed)
-    if m:
-        result["inspection_note"] = m.group(0).replace(" ", "")
-    else:
-        # 試搵 42610002917 這種，42其實係IN
-        m = re.search(r"42\s*61\d{7,10}\s*(?:\(\d+\))?", text_upper_fixed)
-        if m:
-            raw = m.group(0).replace(" ","")
-            # 42 -> IN, 61 -> 26? 其實 4261 -> IN26
-            fixed = "IN" + raw[2:]  # 去掉開頭42
-            fixed = fixed.replace("61","26",1) if fixed.startswith("IN61") else fixed
-            result["inspection_note"] = fixed.replace(" ","")
-        else:
-            # 直接搵 2610002917 這串，前面加IN
-            m = re.search(r"26\d{8,10}(?:\(\d+\))?", text_upper_fixed.replace(" ",""))
-            if m:
-                num = re.search(r"26\d{8,10}", m.group(0)).group(0)
-                suffix = re.search(r"\(\d+\)", m.group(0))
-                suffix = suffix.group(0) if suffix else ""
-                result["inspection_note"] = f"IN{num}{suffix}"
+    result["inspection_note"] = extract_inspection_note_robust(text_upper)
+    result["product_code"] = extract_product_code_robust(text_upper_fixed)
 
-    # 2. Product Code - 修復 SPB//C006
-    m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", text_upper_fixed)
-    if m:
-        result["product_code"] = clean_product_code_candidate(m.group(1))
-    if not result["product_code"]:
-        # 兜底：搵 SPB...C00...
-        m = re.search(r"SPB[A-Z0-9/\\|]{2,6}00\d", text_upper_fixed)
-        if m:
-            result["product_code"] = clean_product_code_candidate(m.group(0))
-    if not result["product_code"]:
-        m = re.search(r"\bSP[A-Z]{2,5}M[0-9]{2,6}\b", text_upper_fixed)
-        if m:
-            result["product_code"] = clean_product_code_candidate(m.group(0))
-
-    # WIP名
     m = re.search(r"WIP[^\n\r]{2,80}", text)
     if m:
         result["product_name"] = m.group(0).strip()
 
-    # 3. Lot No - 修復 Lotllo
-    m = re.search(r"LOT\w{0,5}\s*(\d{6}[A-Z/\\|])", text_upper_fixed)
+    # Lot
+    m = re.search(r"LOT\w{0,5}\s*(\d{6}[A-Z/\\|]?)", text_upper_fixed)
     if m:
-        lot_raw = m.group(1).replace("/","").replace("|","I")
-        result["lot_no"] = lot_raw.upper()
+        result["lot_no"] = m.group(1).replace("/","").replace("|","I").upper()
     if not result["lot_no"]:
         m = re.search(r"\b(26\d{4}[A-Z])\b", text_upper_fixed)
         if m:
             result["lot_no"] = m.group(1).upper()
-    if not result["lot_no"]:
-        m = re.search(r"\b\d{6}[A-Z]\b", text_upper_fixed.replace(" ",""))
-        if m and "2610002" not in m.group(0):
-            result["lot_no"] = m.group(0).upper()
 
-    # 4. Quantity
     for n in re.findall(r"(\d{1,3},\d{3})", text_upper_fixed):
         try:
             v = int(n.replace(",",""))
-            if 100 <= v <= 20000 and v not in [2026,2025,2610,2024]:
+            if 100 <= v <= 20000 and v not in [2026,2025,2610]:
                 result["quantity"] = float(v)
                 result["accepted"] = float(v)
                 break
-        except: pass
+        except:
+            pass
 
-    # 5. MFD - 修復 N30 0CT
     mfd_found = ""
-    # 先搵所有 OCT 日期，容許前面有字母
-    oct_pattern = r"(?:^|[^A-Z0-9])(\d{1,2})\s*OCT\s*(\d{4})"
-    oct_dates = re.findall(oct_pattern, text_upper_fixed)
+    oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper_fixed)
     if len(oct_dates) >= 2:
-        # 第二個係 Source
-        day, year = oct_dates[1]
-        mfd_found = f"{int(day):02d}/10/{int(year)}"
-    elif len(oct_dates) == 1:
-        day, year = oct_dates[0]
-        mfd_found = f"{int(day):02d}/10/{int(year)}"
-    else:
-        # 搵 SOURCE
-        m = re.search(r"SOURCE.*?(\d{1,2})\s*OCT\s*(\d{4})", text_upper_fixed, re.DOTALL)
-        if m:
-            mfd_found = f"{int(m.group(1)):02d}/10/{int(m.group(2))}"
-
+        mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
+    elif len(oct_dates)==1:
+        mfd_found = f"{int(oct_dates[0][0]):02d}/10/{int(oct_dates[0][1])}"
     if mfd_found:
         result["date"] = mfd_found
         result["mfd"] = mfd_found
 
-    if result["product_code"] and result["inspection_note"]:
-        result["confidence"] = "high"
-    elif result["quantity"]>0:
-        result["confidence"] = "medium"
+    if result["product_code"] or result["quantity"]>0:
+        result["confidence"] = "high" if result["product_code"] and result["inspection_note"] else "medium"
     return result
 
 def map_product_code_to_wms_sku(product_code, product_name, df_master):
@@ -207,21 +182,17 @@ def map_product_code_to_wms_sku(product_code, product_name, df_master):
     product_code = str(product_code).strip().upper()
     df_master["SKU_str"] = df_master["SKU"].astype(str).str.strip()
     df_master["SKU_base"] = df_master["SKU_str"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
-
     exact = df_master[df_master["SKU_base"] == product_code]
     if not exact.empty:
         return exact.iloc[0].to_dict(), f"✅ 用 {product_code} 對應 {exact.iloc[0]['SKU_str']}"
-
     contains = df_master[df_master["SKU_str"].str.upper().str.contains(product_code, na=False)]
     if not contains.empty:
         return contains.iloc[0].to_dict(), f"✅ 用 {product_code} 包含對應 {contains.iloc[0]['SKU_str']}"
-
     close = difflib.get_close_matches(product_code, df_master["SKU_base"].tolist(), n=1, cutoff=0.8)
     if close:
         row = df_master[df_master["SKU_base"]==close[0]].iloc[0].to_dict()
         return row, f"✅ 用 {product_code} 模糊對應 {row['SKU_str']}"
-
-    return None, f"❌ Master無 {product_code} (現有Base: {', '.join(df_master['SKU_base'].tolist()[:8])})"
+    return None, f"❌ Master無 {product_code}"
 
 @st.cache_resource
 def get_client():
@@ -265,8 +236,7 @@ def normalize_mfd_str(s):
     s = str(s).strip()
     if s.lower() in ["","none","nan","nat","無mfd"]:
         return "無MFD"
-    if "|" in s:
-        s = s.split("|")[0].strip()
+    if "|" in s: s = s.split("|")[0].strip()
     for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
         try:
             dt = datetime.datetime.strptime(s, fmt)
@@ -445,11 +415,12 @@ def overwrite_master(df):
 try: 
     ensure_sheets()
     check_and_auto_send_wms()
-except: pass
+except Exception as e:
+    print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V49.1 登入 - OCR修復版")
+    st.title("WMS V49.2 登入 - 穩定版")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -463,7 +434,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V49.1 OCR錯字修復")
+st.sidebar.caption(f"🔥 V49.2 穩定修復版 無cv2")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -478,7 +449,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V49.1 - OCR修復版")
+st.title("WMS V49.2 - 穩定修復版")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -491,8 +462,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V49.1")
-    st.info("💡 V49.1：已修復 IN→42、M→//、0ct→Oct，SPB//C006會自動轉SPBMC006")
+    st.subheader("📸 AI智能入庫 - V49.2")
+    st.info("💡 V49.2：已修復Oh no錯誤 + SPB//C006→SPBMC006 + 42→IN + 支援---WIP中文")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -503,7 +474,7 @@ with tab_ai:
                 st.image(af, caption=f"原圖 {af.name}", use_container_width=True)
                 fb_orig, fb_save, _, _ = compress_inspection_dual(af)
                 if fb_orig:
-                    with st.spinner("🔍 辨識中(已修復錯字)..."):
+                    with st.spinner("🔍 辨識中..."):
                         parsed = ai_parse_inspection_free(fb_orig)
             with c2:
                 if fb_orig:
@@ -515,7 +486,7 @@ with tab_ai:
                         if sku_info: st.success(f"WMS SKU: {sku_info.get('SKU','')}")
                     else:
                         sku_info = None
-                        st.warning("未認到Product Code，試下影清晰啲")
+                        st.warning("未認到Product Code，試下影清啲或手動揀")
                     try:
                         default_mfd_date = datetime.datetime.strptime(parsed["mfd"], "%d/%m/%Y").date() if parsed.get("mfd","") else None
                     except:
