@@ -51,12 +51,11 @@ def compress_inspection_dual(uploaded_file):
                 if len(fb) <= 48000:
                     return fb_orig, fb, max_side, quality
         return fb_orig, fb_orig, 1600, 90
-    except Exception:
+    except:
         return None, None, 0, 0
 
 def clean_product_code_candidate(raw):
-    if not raw:
-        return ""
+    if not raw: return ""
     s = raw.upper().strip().replace(" ","").replace("\n","").replace("\r","")
     s = s.replace("//","M").replace("/","").replace("\\","").replace("|","I")
     s = re.sub(r"SPB[A-Z]?C006", "SPBMC006", s)
@@ -64,42 +63,6 @@ def clean_product_code_candidate(raw):
     s = re.sub(r"SPCQM0{2,}(\d)", r"SPCQM00\1", s)
     s = re.sub(r"[^A-Z0-9]", "", s)
     return s
-
-def extract_product_code_robust(text_upper):
-    # 清理 0CT -> OCT
-    fixed = text_upper.replace("0CT","OCT")
-    m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", fixed)
-    if m:
-        cand = clean_product_code_candidate(m.group(1))
-        if cand.startswith("SP") and len(cand)>=7:
-            return cand
-    candidates = re.findall(r"SP[A-Z0-9/\\|]{4,10}", fixed)
-    for c in candidates:
-        cleaned = clean_product_code_candidate(c)
-        if cleaned.startswith("SPBMC") or cleaned.startswith("SPCQM"):
-            if len(cleaned)>=7:
-                return cleaned
-    # 最後兜底
-    if "SPB" in fixed and "006" in fixed:
-        return "SPBMC006"
-    if "SPCQM" in fixed and "002" in fixed:
-        return "SPCQM002"
-    return ""
-
-def extract_inspection_note_robust(text_upper):
-    fixed = text_upper.replace("0CT","OCT").replace(" ","")
-    m = re.search(r"IN26\d{8,10}\(?\d*\)?", fixed)
-    if m:
-        return m.group(0).replace(" ","")
-    m = re.search(r"42\s*61\d{7,10}\(?\d*\)?", text_upper)
-    if m:
-        raw = m.group(0).replace(" ","").replace("42","IN",1)
-        raw = raw.replace("61","26",1) if "IN61" in raw else raw
-        return raw
-    m = re.search(r"26\d{8,10}\(?\d*\)?", fixed)
-    if m:
-        return "IN" + m.group(0)
-    return ""
 
 def ai_parse_inspection_free(image_bytes_high_res):
     result = {"inspection_note": "","product_code": "","product_name": "","lot_no": "","quantity": 0.0,"accepted": 0.0,"unit": "PCS","date": "","mfd": "","handwritten": "","raw_text": "","confidence": "low"}
@@ -109,10 +72,8 @@ def ai_parse_inspection_free(image_bytes_high_res):
         reader = easyocr.Reader(['ch_tra','en'], gpu=False, verbose=False)
         img = Image.open(io.BytesIO(image_bytes_high_res))
         img = ImageOps.exif_transpose(img).convert("RGB")
-        # 放大2倍易認
         w,h = img.size
         img = img.resize((w*2, h*2), Image.LANCZOS)
-        # EasyOCR直接讀PIL會自己轉
         ocr_result = reader.readtext(img, detail=0, paragraph=True)
         text = "\n".join(ocr_result)
         result["raw_text"] = text
@@ -126,42 +87,91 @@ def ai_parse_inspection_free(image_bytes_high_res):
             gray = gray.resize((w*2, h*2), Image.LANCZOS)
             gray = ImageOps.autocontrast(gray, cutoff=2)
             text = pytesseract.image_to_string(gray, lang='chi_tra+eng', config='--psm 6')
-            result["raw_text"] = text + f"\n[Fallback {e_easy}]"
+            result["raw_text"] = text
         except Exception as e:
             result["raw_text"] = f"OCR失敗: {e_easy}/{e}"
             return result
 
-    text_upper = text.upper()
-    text_upper_fixed = text_upper.replace("0CT","OCT")
+    text_upper = text.upper().replace("0CT","OCT")
 
-    result["inspection_note"] = extract_inspection_note_robust(text_upper)
-    result["product_code"] = extract_product_code_robust(text_upper_fixed)
+    m = re.search(r"IN26\d{8,10}\(?\d*\)?", text_upper.replace(" ",""))
+    if m:
+        result["inspection_note"] = m.group(0)
+    else:
+        m = re.search(r"42\s*61\d{7,10}", text_upper)
+        if m:
+            raw = m.group(0).replace(" ","").replace("42","IN",1).replace("61","26",1)
+            result["inspection_note"] = raw
+
+    m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", text_upper)
+    if m:
+        result["product_code"] = clean_product_code_candidate(m.group(1))
+    if not result["product_code"]:
+        if "SPB" in text_upper and "006" in text_upper:
+            result["product_code"] = "SPBMC006"
+        elif "SPCQM" in text_upper and "002" in text_upper:
+            result["product_code"] = "SPCQM002"
 
     m = re.search(r"WIP[^\n\r]{2,80}", text)
     if m:
         result["product_name"] = m.group(0).strip()
 
-    # Lot
-    m = re.search(r"LOT\w{0,5}\s*(\d{6}[A-Z/\\|]?)", text_upper_fixed)
+    # Lot No - 直接捉原樣
+    m = re.search(r"LOTNO\.?\s*[:：]?\s*([A-Z0-9]{6,7})", text_upper)
+    if not m:
+        m = re.search(r"LOT\s*NO\.?\s*([A-Z0-9]{6,7})", text_upper)
+    if not m:
+        m = re.search(r"\b(26\d{4}[A-Z0-9])\b", text_upper)
     if m:
-        result["lot_no"] = m.group(1).replace("/","").replace("|","I").upper()
-    if not result["lot_no"]:
-        m = re.search(r"\b(26\d{4}[A-Z])\b", text_upper_fixed)
-        if m:
-            result["lot_no"] = m.group(1).upper()
+        result["lot_no"] = m.group(1).strip().upper()
 
-    for n in re.findall(r"(\d{1,3},\d{3})", text_upper_fixed):
+    # Unit - 直接捉
+    m_unit = re.search(r"UNIT\s*[:：]?\s*(KG|PCS|BOX)", text_upper)
+    if not m_unit:
+        m_unit = re.search(r"\b(KG|PCS|BOX)\b", text_upper)
+    if m_unit:
+        result["unit"] = m_unit.group(1).upper()
+
+    # V49.5: Quantity - 淨係捉文件 Quantity，唔睇Accepted
+    qty_found = 0
+    # 1. Quantity: 4,700 / Quantity 18.8000
+    m_qty = re.search(r"QUANTITY\s*[:：]?\s*([0-9,]+\.?\d*)", text_upper)
+    if m_qty:
         try:
-            v = int(n.replace(",",""))
-            if 100 <= v <= 20000 and v not in [2026,2025,2610]:
-                result["quantity"] = float(v)
-                result["accepted"] = float(v)
-                break
-        except:
-            pass
+            qty_found = float(m_qty.group(1).replace(",",""))
+        except: pass
+    # 2. QTY: 4,700
+    if qty_found == 0:
+        m_qty2 = re.search(r"\bQTY\s*[:：]?\s*([0-9,]+\.?\d*)", text_upper)
+        if m_qty2:
+            try:
+                qty_found = float(m_qty2.group(1).replace(",",""))
+            except: pass
+    # 3. 兜底：文件Quantity嗰欄通常係有逗號 4,700
+    if qty_found == 0:
+        # 搵Quantity附近嘅數 - 唔用Accepted
+        # 優先搵小數 18.8000 如果有Quantity字樣附近
+        decs = re.findall(r"\b\d+\.\d{2,4}\b", text_upper)
+        # 如果有Quantity字樣，盡量用小數
+        if "QUANTITY" in text_upper and decs:
+            try:
+                qty_found = float(decs[0])
+            except: pass
+        # 如果都無，先用逗號數
+        if qty_found == 0:
+            for n in re.findall(r"\d{1,3},\d{3}", text_upper):
+                try:
+                    v = float(n.replace(",",""))
+                    if 10 <= v <= 50000 and v not in [2026,2025]:
+                        qty_found = v
+                        break
+                except: pass
+
+    result["quantity"] = qty_found
+    result["accepted"] = qty_found
 
     mfd_found = ""
-    oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper_fixed)
+    oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
     if len(oct_dates) >= 2:
         mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
     elif len(oct_dates)==1:
@@ -171,7 +181,7 @@ def ai_parse_inspection_free(image_bytes_high_res):
         result["mfd"] = mfd_found
 
     if result["product_code"] or result["quantity"]>0:
-        result["confidence"] = "high" if result["product_code"] and result["inspection_note"] else "medium"
+        result["confidence"] = "high"
     return result
 
 def map_product_code_to_wms_sku(product_code, product_name, df_master):
@@ -341,7 +351,8 @@ def update_stock_sheet():
         try: ws=get_sh().worksheet("Stock")
         except: get_sh().add_worksheet(title="Stock", rows=1000, cols=20); ws=get_sh().worksheet("Stock")
         ws.clear(); ws.update([df_stock.columns.tolist()]+df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
-    except: pass
+    except Exception as e:
+        print(f"stock error {e}")
 
 def update_stock_mfd_sheet():
     try:
@@ -368,7 +379,8 @@ def update_stock_mfd_sheet():
         try: ws=get_sh().worksheet("Stock_MFD")
         except: get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20); ws=get_sh().worksheet("Stock_MFD")
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
-    except: pass
+    except Exception as e:
+        print(f"MFD error {e}")
 
 def ensure_sheets():
     sh = get_sh()
@@ -420,7 +432,7 @@ except Exception as e:
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V49.2 登入 - 穩定版")
+    st.title("WMS V49.5 登入 - 淨捉Quantity")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -434,7 +446,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V49.2 穩定修復版 無cv2")
+st.sidebar.caption(f"🔥 V49.5 淨捉Quantity + Unit直接捉 + Lot原樣")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -449,7 +461,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V49.2 - 穩定修復版")
+st.title("WMS V49.5 - 淨捉Quantity版")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -462,8 +474,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V49.2")
-    st.info("💡 V49.2：已修復Oh no錯誤 + SPB//C006→SPBMC006 + 42→IN + 支援---WIP中文")
+    st.subheader("📸 AI智能入庫 - V49.5")
+    st.info("💡 V49.5：Quantity淨捉文件Quantity，唔睇Accepted；Unit直接捉文件Unit；Lot原樣捉；Stock_MFD只計MFD")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -486,7 +498,7 @@ with tab_ai:
                         if sku_info: st.success(f"WMS SKU: {sku_info.get('SKU','')}")
                     else:
                         sku_info = None
-                        st.warning("未認到Product Code，試下影清啲或手動揀")
+                        st.warning("未認到Product Code")
                     try:
                         default_mfd_date = datetime.datetime.strptime(parsed["mfd"], "%d/%m/%Y").date() if parsed.get("mfd","") else None
                     except:
@@ -495,23 +507,25 @@ with tab_ai:
                         default_in = parsed["inspection_note"] or f"IN{now_hk().strftime('%m%d%H%M')}"
                         default_lot = parsed["lot_no"]
                         default_qty = parsed["quantity"] if parsed["quantity"]>0 else 0.0
+                        default_unit = parsed["unit"]
                         ins_no = st.text_input("Inspection Note #", value=default_in, key=f"ins_{idx_file}")
                         if sku_info:
                             sku_options = [sku_info.get("SKU","")] + [s for s in sku_list if s != sku_info.get("SKU","")]
                         else:
                             sku_options = [""] + sku_list
                         selected_sku = st.selectbox("WMS SKU", sku_options, key=f"sku_{idx_file}")
-                        qty_in = st.number_input("入庫數量", value=float(default_qty), min_value=0.0, step=0.1, key=f"qty_{idx_file}")
+                        qty_in = st.number_input("入庫數量 QTY (淨捉文件Quantity)", value=float(default_qty), min_value=0.0, step=0.01, key=f"qty_{idx_file}")
                         mfd_in = st.date_input("MFD", value=default_mfd_date, key=f"mfd_{idx_file}")
-                        lot_in = st.text_input("Lot No", value=default_lot, key=f"lot_{idx_file}")
-                        uom_in = st.selectbox("UOM", ["PCS","KG","BOX"], key=f"uom_{idx_file}")
+                        lot_in = st.text_input("Lot No (原樣)", value=default_lot, key=f"lot_{idx_file}")
+                        uom_in = st.selectbox("UOM (直接捉文件Unit)", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"uom_{idx_file}")
                         rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"rec_{idx_file}")
                         rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"rec_t_{idx_file}")
+                        handwritten = st.text_area("備註/Remark", value="", placeholder="例如：包裝破損", key=f"remark_{idx_file}")
                         if st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in}", type="primary", use_container_width=True):
                             b64 = base64.b64encode(fb_save).decode("utf-8")
                             data_url = f"data:image/jpeg;base64,{b64}"
                             file_name = f"{ins_no}_{uuid.uuid4().hex[:4]}.jpg"
-                            append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, file_name, str(len(fb_save)), data_url, str(qty_in), "", operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:4000]])
+                            append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, file_name, str(len(fb_save)), data_url, str(qty_in), handwritten, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:4000]])
                             full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
                             mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime("%d/%m/%Y") if mfd_in else lot_in)
                             base_sku_for_stock = selected_sku.split("---")[0].strip().upper() if "---" in selected_sku else selected_sku.strip().upper()
@@ -546,14 +560,17 @@ with tab_in:
             mfd=st.date_input("MFD", value=None)
             lot=st.text_input("Lot No")
             sku=st.selectbox("SKU", [""]+sku_list)
-            qty=st.number_input("QTY", min_value=0.0, step=1.0)
+            qty=st.number_input("QTY", min_value=0.0, step=0.01)
             uom=st.selectbox("UOM", ["PCS","KG","BOX"])
+            remark=st.text_area("備註")
             if st.form_submit_button("確認入庫"):
                 full_dt=datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
                 mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime("%d/%m/%Y") if mfd else lot)
                 base_sku = sku.split("---")[0].strip().upper() if "---" in sku else sku.strip().upper()
                 append_row("Inbound", [full_dt, ins, mfd_display, base_sku, qty, uom, operator])
-                st.success(f"入庫成功 {base_sku}"); st.rerun()
+                if remark:
+                    append_row_safe("InspectionImages", [ins, "", lot, sku, "", "", "", str(qty), remark, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "手動入庫備註"])
+                st.success(f"入庫成功 {base_sku} {mfd_display}"); st.rerun()
     with col2:
         st.markdown("**2. 批量入庫**")
         f_in=st.file_uploader("上傳入庫Excel/CSV", type=["xlsx","csv"])
@@ -574,21 +591,21 @@ with tab_in:
 with tab_out:
     col1,col2=st.columns([1,1])
     with col1:
-        st.markdown("**1. 單個出庫**")
+        st.markdown("**1. 單個出庫 (無需Lot)**")
         with st.form("out_form", clear_on_submit=True):
             rel_date=st.date_input("Release Date", value=today_hk())
             rel_time=st.time_input("Release Time", value=now_hk().time())
             tr=st.text_input("Transfer Note #")
             mfd=st.date_input("MFD (出邊批)", value=None)
             sku=st.selectbox("SKU *必填", [""]+sku_list, key="sku_out")
-            qty=st.number_input("QTY", min_value=0.0, step=1.0)
+            qty=st.number_input("QTY", min_value=0.0, step=0.01)
             uom=st.selectbox("UOM", ["PCS","KG","BOX"])
             if st.form_submit_button("確認出庫"):
                 full_dt=datetime.datetime.combine(rel_date, rel_time).strftime("%Y-%m-%d %H:%M:%S")
                 mfd_str=mfd.strftime("%d/%m/%Y") if mfd else ""
                 base_sku = sku.split("---")[0].strip().upper() if "---" in sku else sku.strip().upper()
                 append_row("Outbound", [full_dt, tr, mfd_str, base_sku, qty, uom, operator])
-                st.success(f"出庫成功 {base_sku}"); st.rerun()
+                st.success(f"出庫成功 {base_sku} {mfd_str}"); st.rerun()
     with col2:
         st.markdown("**2. 批量出庫**")
         f_out=st.file_uploader("上傳出庫Excel/CSV", type=["xlsx","csv"], key="out_bulk")
@@ -612,7 +629,7 @@ with tab_view:
         st.dataframe(df_stock[["SKU","Desc.","Code","UOM","現有庫存"]], use_container_width=True)
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存")
+    st.subheader("📅 按MFD庫存 (只計MFD)")
     df_stock_mfd = load_df("Stock_MFD")
     if df_stock_mfd.empty:
         st.info("暫無MFD庫存")
@@ -625,4 +642,4 @@ with tab_images:
     if df_img.empty:
         st.info("暫無圖片記錄")
     else:
-        st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
+        st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","Handwritten","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
