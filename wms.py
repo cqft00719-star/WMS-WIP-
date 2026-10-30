@@ -65,45 +65,45 @@ def clean_product_code_candidate(raw):
     return s
 
 def extract_quantity_robust(text_upper):
-    # 清理常見OCR錯字
-    txt = text_upper.replace("O","0").replace("o","0").replace("l","1")
-    # 1. 最優先：18.8000 / 18,8000 / 18 . 8000
-    # 容許空格同逗號
-    patterns = [
-        r"\b(\d{1,3})\s*[.,]\s*(\d{3,4})\b",  # 18.8000 / 18,8000
-        r"REJECTED.*?(\d+)\s*[.,]\s*(\d+)",
-        r"SCRAP.*?(\d+)\s*[.,]\s*(\d+)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, txt, re.DOTALL)
-        if m:
-            try:
-                # 有兩個group就合併
-                if len(m.groups()) >= 2 and m.group(2):
-                    whole = f"{m.group(1)}.{m.group(2)}"
-                else:
-                    whole = m.group(1)
-                # 再清一次
-                whole = whole.replace(",",".").replace(" ","")
-                v = float(whole)
-                if 0.01 <= v <= 10000 and v not in [2026.0, 2025.0, 2024.0]:
-                    return v
-            except:
-                pass
-    # 2. 兜底：18.8 這種
-    decs = re.findall(r"\b\d+\.\d{1,4}\b", txt)
-    for d in decs:
+    # 先將常見OCR錯字統一
+    txt = text_upper.replace("O","0").replace("o","0")
+    # V49.9: 1. 最優先捉 Rejected & Scrap 後面嘅 18.8000 (Quantity下面格)
+    m = re.search(r"REJECTED[^0-9]{0,20}(\d+\s*\.\s*\d{3,4})", txt, re.DOTALL)
+    if not m:
+        m = re.search(r"SCRAP[^0-9]{0,20}(\d+\s*\.\s*\d{3,4})", txt, re.DOTALL)
+    if m:
         try:
-            v = float(d)
+            num = m.group(1).replace(" ","")
+            return float(num)
+        except:
+            pass
+    # 2. 全篇捉點小數 18.8000 (唔用逗號，避免4,700變4.7)
+    m = re.search(r"\b(\d+\.\d{3,4})\b", txt)
+    if m:
+        try:
+            return float(m.group(1))
+        except:
+            pass
+    m = re.search(r"\b(\d+\.\d{1,4})\b", txt)
+    if m:
+        try:
+            v = float(m.group(1))
             if 0.01 <= v <= 10000 and v not in [2026.0, 2025.0]:
                 return v
+        except:
+            pass
+    # 3. 最後先捉 4,700 這種 (如果真係PCS)
+    m = re.search(r"\b\d{1,3},\d{3}\b", txt)
+    if m:
+        try:
+            return float(m.group(0).replace(",",""))
         except:
             pass
     return 0
 
 def extract_lot_robust(text_upper):
-    txt = text_upper.upper().replace("/","A").replace("|","A").replace("\\","")
-    # 1. 有Lot No關鍵字
+    txt = text_upper.upper().replace("/","A").replace("|","A").replace("\\","").replace("O","0")
+    # 1. Lot No關鍵字
     m = re.search(r"LOTNO\.?\s*[:：]?\s*([A-Z0-9]{6,8})", txt)
     if not m:
         m = re.search(r"LOT\s*NO\.?\s*([A-Z0-9]{6,8})", txt)
@@ -111,7 +111,7 @@ def extract_lot_robust(text_upper):
         lot = re.sub(r"[^A-Z0-9]","", m.group(1))
         if len(lot) >= 6:
             return lot[:7]
-    # 2. 全篇搵 261029A
+    # 2. 261029A
     m = re.search(r"\b(26\d{4}[A-Z])\b", txt)
     if m:
         return m.group(1)
@@ -134,21 +134,32 @@ def ai_parse_inspection_free(image_bytes_high_res):
         img = Image.open(io.BytesIO(image_bytes_high_res))
         img = ImageOps.exif_transpose(img).convert("RGB")
         w,h = img.size
-        # V49.8: 第一輪全圖
         img_big = img.resize((w*2, h*2), Image.LANCZOS)
         ocr_result = reader.readtext(img_big, detail=0, paragraph=True)
         text = "\n".join(ocr_result)
-        # V49.8: 第二輪專門crop中間表 (Lot No, Quantity, Unit嗰行)
-        # 大約中下位置
+        # V49.9: 3個crop，專捉 Lot No上面、Quantity中間、Unit下面
         try:
-            crop = img.crop((int(w*0.05), int(h*0.35), int(w*0.95), int(h*0.75)))
-            crop = crop.resize((crop.width*2, crop.height*2), Image.LANCZOS)
-            crop = ImageOps.autocontrast(crop, cutoff=2)
-            ocr_crop = reader.readtext(crop, detail=0, paragraph=True)
-            text_crop = "\n".join(ocr_crop)
-            text = text + "\n" + text_crop
-        except:
-            pass
+            # 上面 5%-45% Lot No
+            crop_top = img.crop((int(w*0.02), int(h*0.05), int(w*0.98), int(h*0.45)))
+            crop_top = crop_top.resize((crop_top.width*2, crop_top.height*2), Image.LANCZOS)
+            crop_top = ImageOps.autocontrast(crop_top, cutoff=1)
+            ocr_top = reader.readtext(crop_top, detail=0, paragraph=True)
+            text_top = "\n".join(ocr_top)
+            text = text + "\n" + text_top
+            # 中間 30%-75% Quantity
+            crop_mid = img.crop((int(w*0.02), int(h*0.30), int(w*0.98), int(h*0.75)))
+            crop_mid = crop_mid.resize((crop_mid.width*2, crop_mid.height*2), Image.LANCZOS)
+            ocr_mid = reader.readtext(crop_mid, detail=0, paragraph=True)
+            text_mid = "\n".join(ocr_mid)
+            text = text + "\n" + text_mid
+            # 下面 60%-95% Unit
+            crop_bot = img.crop((int(w*0.02), int(h*0.60), int(w*0.98), int(h*0.95)))
+            crop_bot = crop_bot.resize((crop_bot.width*2, crop_bot.height*2), Image.LANCZOS)
+            ocr_bot = reader.readtext(crop_bot, detail=0, paragraph=True)
+            text_bot = "\n".join(ocr_bot)
+            text = text + "\n" + text_bot
+        except Exception as e_crop:
+            print(f"crop fail {e_crop}")
         result["raw_text"] = text
     except Exception as e_easy:
         try:
@@ -189,12 +200,10 @@ def ai_parse_inspection_free(image_bytes_high_res):
     if m:
         result["product_name"] = m.group(0).strip()
 
-    # V49.8: 按你講嘅3格
     result["lot_no"] = extract_lot_robust(text_upper)
     result["quantity"] = extract_quantity_robust(text_upper)
     result["accepted"] = result["quantity"]
 
-    # Unit下面格
     unit_found = ""
     m_unit = re.search(r"UNIT\s*[:：]?\s*(KG|PCS|BOX)", text_upper)
     if m_unit:
@@ -471,7 +480,7 @@ except Exception as e:
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V49.8 登入 - 按表頭+容錯")
+    st.title("WMS V49.9 登入 - 三格精準")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -485,7 +494,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V49.8 18.8+KG+Lot容錯")
+st.sidebar.caption(f"🔥 V49.9 18.8+KG+Lot三crop")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -500,7 +509,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V49.8 - 按表頭+容錯")
+st.title("WMS V49.9 - 三格精準版")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -513,8 +522,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V49.8")
-    st.info("💡 V49.8：Quantity下面格=18.8000(容錯O→0, 逗號→點, 空格), Unit下面格=KG, Lot No下面格=261029A(第二輪放大認)")
+    st.subheader("📸 AI智能入庫 - V49.9")
+    st.info("💡 V49.9：Quantity下面格=18.8000(只用點，唔會4,700變4.7)，Unit下面格=KG，Lot No下面格=3個crop專捉261029A")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
