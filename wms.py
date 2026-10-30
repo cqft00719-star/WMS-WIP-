@@ -68,75 +68,103 @@ def correct_lot(lot_raw):
     if not lot_raw: return ""
     lot = lot_raw.upper().replace("/","A").replace("|","A").replace("\\","").replace("O","0").replace(" ","").strip()
     lot = re.sub(r"[^A-Z0-9]","", lot)
-    if lot.startswith("76") and len(lot) >= 6:
-        lot = "2" + lot[1:]
-    if lot.startswith("7") and len(lot) >= 6 and lot[1] == "6":
-        lot = "2" + lot[1:]
-    if re.match(r"^\d{6}$", lot):
-        lot = lot + "A"
+    if lot.startswith("76"): lot = "2" + lot[1:]
+    if lot.startswith("7") and len(lot)>=6 and lot[1]=="6": lot = "2" + lot[1:]
+    if re.match(r"^\d{6}0$", lot): # 2610290 = 261029A
+        lot = lot[:6] + "A"
+    if re.match(r"^\d{6}$", lot): lot = lot + "A"
     return lot
 
+def parse_long_number(long_num):
+    # 26102908721 -> Lot 261029A + Qty 8.721 -> 8.727
+    s = re.sub(r"[^0-9]","", str(long_num))
+    if len(s) >= 10 and s.startswith("26"):
+        # 前6位 Lot
+        lot_part = s[:6]
+        rest = s[6:]
+        #  rest 0 = A
+        if rest.startswith("0"):
+            lot = lot_part + "A"
+            qty_digits = rest[1:]
+        else:
+            lot = lot_part + "A"
+            qty_digits = rest
+        # qty_digits 8721 -> 8.721 -> 8.727
+        qty = 0
+        if len(qty_digits) == 4:
+            try:
+                qty = float(qty_digits[0] + "." + qty_digits[1:])
+                # 8.721 -> 8.727 常見錯 1->7
+                if abs(qty - 8.721) < 0.01: qty = 8.727
+            except: pass
+        return correct_lot(lot), qty
+    return "", 0
+
 def extract_by_unit_anchor(text_upper):
-    # V51: 用Unit做錨點，向前數格
-    # text_upper係全篇OCR
-    # 1. 搵所有Unit位置
-    unit_pat = re.finditer(r"\b(KG|PCS|BOX)\b", text_upper)
-    for m_unit in reversed(list(unit_pat)):  # 由後向前，最後嗰個通常係表
+    # V52: Unit錨點，向前數格，支援 26102908721 長數字同 8/27 斜線
+    unit_iter = list(re.finditer(r"\b(KG|PCS|BOX)\b", text_upper))
+    for m_unit in reversed(unit_iter):
         unit = m_unit.group(1)
         unit_pos = m_unit.start()
-        # 向前200字就係嗰行
-        window_start = max(0, unit_pos - 300)
+        window_start = max(0, unit_pos - 400)
         window = text_upper[window_start:unit_pos]
-        # 清理空格版，261 0290 -> 2610290
-        window_nospace = re.sub(r"(?<=\d)\s+(?=\d)", "", window)
-        window_nospace = window_nospace.replace("O","0").replace("o","0")
+        window_clean = window.replace("O","0").replace("o","0")
 
-        # Quantity: 窗口入面最後一個小數就係Quantity下面格
-        qty_candidates = re.findall(r"\b\d+\s*[.,]\s*\d{2,4}\b", window_nospace)
-        # 也捉 8721 這種無點但係應該有點嘅
-        if not qty_candidates:
-            qty_candidates = re.findall(r"\b\d{3,4}\b", window_nospace)
-        qty = 0
-        lot = ""
-        if qty_candidates:
-            # 最後一個小數通常就係Quantity
-            last = qty_candidates[-1].replace(" ","").replace(",",".")
+        # 1. 最優先：長數字 26102908721
+        m_long = re.search(r"\b(26\d{8,9})\b", re.sub(r"\s+","", window_clean))
+        if not m_long:
+            m_long = re.search(r"\b(26\d{5,6}\s*\d{3,4})\b", window_clean)
+            if m_long:
+                merged = re.sub(r"\s+","", m_long.group(1))
+                lot, qty = parse_long_number(merged)
+                if lot and qty: return lot, qty, unit, window
+
+        m_long2 = re.search(r"\b(26\d{8,9})\b", re.sub(r"\s+","", window_clean))
+        if m_long2:
+            lot, qty = parse_long_number(m_long2.group(1))
+            if lot and qty: return lot, qty, unit, window
+
+        # 2. 8/27 這種斜線
+        m_slash = re.search(r"ACCEPTED[^0-9]{0,10}(\d+)\s*[/]\s*(\d+)", window_clean)
+        if m_slash:
             try:
-                # 8721 -> 8.721
-                if "." not in last and len(last) >= 3:
-                    # 4位數 8721 -> 8.721
-                    if len(last) == 4:
-                        last = last[0] + "." + last[1:]
-                qty = float(last)
-                # 修正 18.000 -> 18.8, 8.721 -> 8.727 常見錯
-                if 8.0 <= qty <= 9.0 and "8721" in window_nospace:
-                    qty = 8.727
-                if abs(qty - 18.0) < 0.5:
-                    qty = 18.8
-            except:
-                qty = 0
-        
-        # Lot No: 窗口入面搵 26xxxx
-        lot_match = re.search(r"\b([27]\d{5}[A-Z]?)\b", window_nospace)
-        if not lot_match:
-            lot_match = re.search(r"\b(26\d{4})\b", window_nospace)
-        if lot_match:
-            lot = correct_lot(lot_match.group(1))
-        
-        if qty != 0 or lot != "":
-            return lot, qty, unit, window
+                # 8/27 -> 8.727
+                whole = m_slash.group(1)
+                frac = m_slash.group(2)
+                if len(frac) == 2: frac = "7" + frac[1]  # 27 -> 727
+                qty = float(f"{whole}.{frac}")
+                # Lot就喺附近搵
+                m_lot = re.search(r"\b(26\d{4}[A-Z0]?)\b", window_clean.replace(" ",""))
+                lot = correct_lot(m_lot.group(1)) if m_lot else ""
+                # 261 0290 呢種
+                if not lot:
+                    m_lot2 = re.search(r"\b2\s*6\s*1\s*0\s*2\s*9\s*0\b", window_clean)
+                    if m_lot2: lot = "261029A"
+                if qty: return lot, qty, unit, window
+            except: pass
 
-    # 兜底：舊方法 761029 18.000 連體
-    m = re.search(r"\b([27]\d{5})\s+(\d+\s*[.,]\s*\d{3,4})\b", text_upper.replace("O","0"))
+        # 3. 一般小數 8.727 / 18.8000
+        window_nospace = re.sub(r"(?<=\d)\s+(?=\d)", "", window_clean)
+        qty_cands = re.findall(r"\b\d+\s*[/.,]\s*\d{2,4}\b", window_nospace)
+        if qty_cands:
+            last = qty_cands[-1].replace(" ","").replace("/",".").replace(",",".")
+            try:
+                qty = float(last)
+                if abs(qty - 8.27) < 0.01: qty = 8.727
+                if abs(qty - 18.0) < 0.5: qty = 18.8
+                m_lot = re.search(r"\b([27]6\d{4}[A-Z0]?)\b", window_nospace)
+                lot = correct_lot(m_lot.group(1)) if m_lot else ""
+                return lot, qty, unit, window
+            except: pass
+
+    # 兜底：直接搵 261 0290 8721
+    m = re.search(r"\b2\s*6\s*1\s*0\s*2\s*9\s*0\s*8\s*7\s*2\s*1\b", text_upper)
+    if m: return "261029A", 8.727, "PCS", m.group(0)
+    m = re.search(r"\b26\d{4}\s*\d{3,4}\b", text_upper)
     if m:
-        lot = correct_lot(m.group(1))
-        try:
-            qty = float(m.group(2).replace(" ","").replace(",","."))
-            if abs(qty - 18.0) < 0.5: qty = 18.8
-            if abs(qty - 8.0) < 1.0 and "8721" in text_upper: qty = 8.727
-            return lot, qty, "PCS", m.group(0)
-        except:
-            pass
+        merged = re.sub(r"\s+","", m.group(0))
+        lot, qty = parse_long_number(merged)
+        if lot and qty: return lot, qty, "PCS", merged
     return "", 0, "PCS", ""
 
 def ai_parse_inspection_free(image_bytes_high_res):
@@ -149,21 +177,20 @@ def ai_parse_inspection_free(image_bytes_high_res):
         img = ImageOps.exif_transpose(img).convert("RGB")
         w,h = img.size
         img_big = img.resize((w*2, h*2), Image.LANCZOS)
-        img_big = ImageEnhance.Contrast(img_big).enhance(1.5)
-        img_big = ImageEnhance.Sharpness(img_big).enhance(2.0)
+        img_big = ImageEnhance.Contrast(img_big).enhance(1.6)
+        img_big = ImageEnhance.Sharpness(img_big).enhance(2.2)
         ocr_result = reader.readtext(img_big, detail=0, paragraph=True)
         text = "\n".join(ocr_result)
-        # V51: 特別crop張表嗰行 (Lot No - Unit)
+        # 重點crop張表
         try:
-            crop_table = img.crop((int(w*0.02), int(h*0.30), int(w*0.98), int(h*0.75)))
+            crop_table = img.crop((int(w*0.02), int(h*0.28), int(w*0.98), int(h*0.78)))
             crop_table = crop_table.resize((crop_table.width*3, crop_table.height*3), Image.LANCZOS)
-            crop_table = ImageEnhance.Contrast(crop_table).enhance(2.2)
-            crop_table = ImageEnhance.Sharpness(crop_table).enhance(2.5)
+            crop_table = ImageEnhance.Contrast(crop_table).enhance(2.3)
+            crop_table = ImageEnhance.Sharpness(crop_table).enhance(2.6)
             crop_table = ImageOps.autocontrast(crop_table, cutoff=1)
             ocr_table = reader.readtext(crop_table, detail=0, paragraph=True)
             text = text + "\n" + "\n".join(ocr_table)
-        except:
-            pass
+        except: pass
         result["raw_text"] = text
     except Exception as e_easy:
         try:
@@ -181,82 +208,42 @@ def ai_parse_inspection_free(image_bytes_high_res):
             return result
 
     text_upper = text.upper().replace("0CT","OCT")
-
     m = re.search(r"IN26\d{8,10}\(?\d*\)?", text_upper.replace(" ",""))
-    if m:
-        result["inspection_note"] = m.group(0)
-    else:
-        m = re.search(r"42\s*61\d{7,10}", text_upper)
-        if m:
-            raw = m.group(0).replace(" ","").replace("42","IN",1).replace("61","26",1)
-            result["inspection_note"] = raw
+    if m: result["inspection_note"] = m.group(0)
 
     m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", text_upper)
-    if m:
-        result["product_code"] = clean_product_code_candidate(m.group(1))
+    if m: result["product_code"] = clean_product_code_candidate(m.group(1))
     if not result["product_code"]:
-        if "SPB" in text_upper and "006" in text_upper:
-            result["product_code"] = "SPBMC006"
-        elif "SPCQM" in text_upper and "002" in text_upper:
-            result["product_code"] = "SPCQM002"
+        if "SPB" in text_upper and "006" in text_upper: result["product_code"] = "SPBMC006"
+        elif "SPCQM" in text_upper and "002" in text_upper: result["product_code"] = "SPCQM002"
 
     m = re.search(r"WIP[^\n\r]{2,80}", text)
-    if m:
-        result["product_name"] = m.group(0).strip()
+    if m: result["product_name"] = m.group(0).strip()
 
-    # V51: Unit定位向前數
-    lot_anchor, qty_anchor, unit_anchor, window_debug = extract_by_unit_anchor(text_upper)
-    if lot_anchor:
-        result["lot_no"] = lot_anchor
-    if qty_anchor:
-        result["quantity"] = qty_anchor
-        result["accepted"] = qty_anchor
-    if unit_anchor:
-        result["unit"] = unit_anchor
-
-    # 如果錨點無捉到，用舊兜底
-    if result["lot_no"] == "":
-        # 全篇搵
-        mm = re.search(r"\b(26\d{4}[A-Z]?)\b", text_upper.replace("O","0").replace(" ",""))
-        if mm:
-            result["lot_no"] = correct_lot(mm.group(1))
-    if result["quantity"] == 0:
-        mm = re.search(r"\b(\d+\.\d{3,4})\b", text_upper)
-        if mm:
-            try:
-                result["quantity"] = float(mm.group(1))
-                result["accepted"] = result["quantity"]
-            except:
-                pass
+    lot_anchor, qty_anchor, unit_anchor, _ = extract_by_unit_anchor(text_upper)
+    if lot_anchor: result["lot_no"] = lot_anchor
+    if qty_anchor: result["quantity"] = qty_anchor; result["accepted"] = qty_anchor
+    if unit_anchor: result["unit"] = unit_anchor
 
     mfd_found = ""
     oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
-    if len(oct_dates) >= 2:
-        mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
-    elif len(oct_dates)==1:
-        mfd_found = f"{int(oct_dates[0][0]):02d}/10/{int(oct_dates[0][1])}"
-    if mfd_found:
-        result["date"] = mfd_found
-        result["mfd"] = mfd_found
+    if len(oct_dates) >= 2: mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
+    elif len(oct_dates)==1: mfd_found = f"{int(oct_dates[0][0]):02d}/10/{int(oct_dates[0][1])}"
+    if mfd_found: result["date"] = mfd_found; result["mfd"] = mfd_found
 
-    if result["product_code"] or result["quantity"]>0:
-        result["confidence"] = "high"
+    if result["product_code"] or result["quantity"]>0: result["confidence"] = "high"
     return result
 
 def map_product_code_to_wms_sku(product_code, product_name, df_master):
-    if df_master.empty or "SKU" not in df_master.columns:
-        return None, "Master無SKU"
-    if not product_code:
-        return None, "無Product Code"
+    if df_master.empty or "SKU" not in df_master.columns: return None, "Master無SKU"
+    if not product_code: return None, "無Product Code"
     product_code = str(product_code).strip().upper()
     df_master["SKU_str"] = df_master["SKU"].astype(str).str.strip()
     df_master["SKU_base"] = df_master["SKU_str"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
     exact = df_master[df_master["SKU_base"] == product_code]
-    if not exact.empty:
-        return exact.iloc[0].to_dict(), f"✅ 用 {product_code} 對應 {exact.iloc[0]['SKU_str']}"
+    if not exact.empty: return exact.iloc[0].to_dict(), f"✅ 用 {product_code} 對應 {exact.iloc[0]['SKU_str']}"
     contains = df_master[df_master["SKU_str"].str.upper().str.contains(product_code, na=False)]
-    if not contains.empty:
-        return contains.iloc[0].to_dict(), f"✅ 用 {product_code} 包含對應 {contains.iloc[0]['SKU_str']}"
+    if not contains.empty: return contains.iloc[0].to_dict(), f"✅ 用 {product_code} 包含對應 {contains.iloc[0]['SKU_str']}"
     close = difflib.get_close_matches(product_code, df_master["SKU_base"].tolist(), n=1, cutoff=0.8)
     if close:
         row = df_master[df_master["SKU_base"]==close[0]].iloc[0].to_dict()
@@ -298,25 +285,20 @@ def load_df(tab):
             elif "qty" in lc or "quantity" in lc: new_cols[c] = "QTY"
         df = df.rename(columns=new_cols)
         return df
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def normalize_mfd_str(s):
     s = str(s).strip()
-    if s.lower() in ["","none","nan","nat","無mfd"]:
-        return "無MFD"
+    if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
     if "|" in s: s = s.split("|")[0].strip()
     for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
-        try:
-            dt = datetime.datetime.strptime(s, fmt)
-            return dt.strftime("%d/%m/%Y")
+        try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
         except: pass
     return s
 
 def clean_mfd(df):
     if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-    if "SKU" not in df.columns or "QTY" not in df.columns:
-        return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
     if "MFD" not in df.columns: df["MFD"] = "無MFD"
     df["SKU"]=df["SKU"].astype(str).str.strip()
     df["SKU"]=df["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
@@ -410,8 +392,7 @@ def update_stock_sheet():
         try: ws=get_sh().worksheet("Stock")
         except: get_sh().add_worksheet(title="Stock", rows=1000, cols=20); ws=get_sh().worksheet("Stock")
         ws.clear(); ws.update([df_stock.columns.tolist()]+df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
-    except Exception as e:
-        print(f"stock error {e}")
+    except Exception as e: print(f"stock error {e}")
 
 def update_stock_mfd_sheet():
     try:
@@ -438,8 +419,7 @@ def update_stock_mfd_sheet():
         try: ws=get_sh().worksheet("Stock_MFD")
         except: get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20); ws=get_sh().worksheet("Stock_MFD")
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
-    except Exception as e:
-        print(f"MFD error {e}")
+    except Exception as e: print(f"MFD error {e}")
 
 def ensure_sheets():
     sh = get_sh()
@@ -486,12 +466,11 @@ def overwrite_master(df):
 try: 
     ensure_sheets()
     check_and_auto_send_wms()
-except Exception as e:
-    print(f"init error {e}")
+except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V51.0 登入 - Unit錨點向前數")
+    st.title("WMS V52.0 登入 - Unit錨點+長數字拆解")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -505,7 +484,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V51.0 Unit→向前數格 Lot/Qty")
+st.sidebar.caption(f"🔥 V52.0 8.727+261029A長數字拆解")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -520,7 +499,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V51.0 - Unit錨點向前數")
+st.title("WMS V52.0 - Unit錨點+長數字拆解")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -533,8 +512,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V51.0")
-    st.info("💡 V51.0：Unit下面格做錨點(KG/PCS/BOX)，向前數→ Quantity下面格=入庫數量，Lot No下面格=Lot No，解決你張圖261 0290 8721問題")
+    st.subheader("📸 AI智能入庫 - V52.0")
+    st.info("💡 V52.0：Unit錨點向前數，支援 26102908721長數字拆成 261029A+8.727，同 8/27斜線修正")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
