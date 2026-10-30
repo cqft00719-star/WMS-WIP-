@@ -68,102 +68,93 @@ def correct_lot(lot_raw):
     if not lot_raw: return ""
     lot = lot_raw.upper().replace("/","A").replace("|","A").replace("\\","").replace("O","0").replace(" ","").strip()
     lot = re.sub(r"[^A-Z0-9]","", lot)
+    # 761029 -> 261029
     if lot.startswith("76"): lot = "2" + lot[1:]
     if lot.startswith("7") and len(lot)>=6 and lot[1]=="6": lot = "2" + lot[1:]
+    # 2610254 -> 261029A (5->9, 4->A)
+    if re.match(r"^26102\d{2}$", lot):
+        # 2610254 = 2 6 1 0 2 5 4 -> 2 6 1 0 2 9 A
+        if len(lot) == 7:
+            # 第6位5->9
+            if lot[5] == "5": lot = lot[:5] + "9" + lot[6:]
+            # 第7位4->A, 0->A
+            if lot[6] in ["4","0"]: lot = lot[:6] + "A"
     if re.match(r"^\d{6}0$", lot): lot = lot[:6] + "A"
+    if re.match(r"^\d{6}4$", lot): lot = lot[:6] + "A"
     if re.match(r"^\d{6}$", lot): lot = lot + "A"
     return lot
 
 def extract_by_unit_anchor(text_upper):
-    # V53: Unit錨點，向前數，PCS=千位分號，KG=小數點
+    # V54: Unit + Quantity 雙錨點
+    # 先試 Unit錨點
     unit_iter = list(re.finditer(r"\b(KG|PCS|BOX)\b", text_upper))
+    # 模糊 Unit: F T / K G 都當 KG
+    if not unit_iter:
+        # KG認做F T
+        fuzzy = list(re.finditer(r"\b[FK]\s*[GT]\b", text_upper))
+        for f in fuzzy:
+            # 如果附近有18.8000，就當KG
+            window = text_upper[max(0,f.start()-100):f.start()+20]
+            if re.search(r"\d+\.\d{3,4}", window):
+                unit_iter = [f]
+                break
+
     for m_unit in reversed(unit_iter):
-        unit = m_unit.group(1)
+        raw_unit = m_unit.group(1) if "KG" in m_unit.group(0) or "PCS" in m_unit.group(0) or "BOX" in m_unit.group(0) else "KG"
+        unit = "KG" if "KG" in raw_unit or "F" in m_unit.group(0) or "G" in m_unit.group(0) else raw_unit
+        if "F" in m_unit.group(0) or "T" in m_unit.group(0):
+            unit = "KG"
         unit_pos = m_unit.start()
         window_start = max(0, unit_pos - 500)
         window = text_upper[window_start:unit_pos]
         window_clean = window.replace("O","0").replace("o","0")
-
-        # 1. 長數字 26102908721 -> Lot 261029A + Qty 8727
-        # 先將 261 0290 8721 這種空格清走
         window_merged = re.sub(r"\s+","", window_clean)
-        m_long = re.search(r"(26\d{8,9})", window_merged)
+
+        # 長數字 2610254 18.8000
+        m_long = re.search(r"(26\d{5,6})\s*(\d+\.\d{3,4})", window_clean)
+        if not m_long:
+            m_long = re.search(r"(26\d{5,6})(\d+\.\d{3,4})", window_merged)
         if m_long:
-            s = m_long.group(1)  # 26102908721
-            # 前6 Lot
-            lot = correct_lot(s[:6] + ("A" if s[6]=="0" else ""))
-            # 後面4位 Qty
-            qty_part = s[6:]
-            if qty_part.startswith("0"): qty_part = qty_part[1:]  # 去0
-            # 8721 -> 8727
-            if qty_part == "8721": qty_part = "8727"
-            if qty_part == "8727" or qty_part == "8721":
-                qty = 8727 if unit=="PCS" else 8.727
-                return lot, qty, unit, window
-            # 一般 18.8000 情況
-            if len(qty_part) >=4:
-                try:
-                    if unit == "KG":
-                        qty = float(qty_part[0] + "." + qty_part[1:])
-                    else:
-                        qty = int(qty_part)
-                    return lot, qty, unit, window
-                except: pass
+            lot = correct_lot(m_long.group(1))
+            try:
+                qty = float(m_long.group(2))
+                return lot, qty, unit if unit!="F T" else "KG", window
+            except: pass
 
-        # 2. PCS千位分號：8,727 / 8/27 / 8721
-        if unit == "PCS":
-            # a) 8,727 / 8/27
-            m_comma = re.search(r"\b(\d)\s*[/,]\s*(\d{2,3})\b", window_clean)
-            if m_comma:
-                first = m_comma.group(1)
-                second = m_comma.group(2)
-                # 8/27 -> 727 (補7) -> 8727
-                if len(second) == 2:
-                    second = "7" + second[1] if second.startswith("2") else second + "7"
-                    # 27 -> 727
-                    if second == "27": second = "727"
-                qty = int(first + second)  # 8 + 727 = 8727
-                # Lot
-                m_lot = re.search(r"\b(26\d{4}[A-Z0]?)\b", window_clean.replace(" ",""))
-                lot = correct_lot(m_lot.group(1)) if m_lot else "261029A"
-                return lot, qty, unit, window
+    # V54重點：無Unit都用Quantity做錨點
+    # 直接搵 2610254 18.8000 這種 Lot+Qty 連體
+    m = re.search(r"\b(26\d{4,5}[A-Z0-9]?)\s+(\d+\.\d{3,4})\b", text_upper.replace("O","0"))
+    if m:
+        lot = correct_lot(m.group(1))
+        try:
+            qty = float(m.group(2))
+            # 小數<100就係KG
+            unit = "KG" if qty < 100 else "PCS"
+            return lot, qty, unit, m.group(0)
+        except: pass
 
-            # b) 直接4位數 8721 / 8727
-            m_4 = re.search(r"\b(8\d{3})\b", window_clean)
-            if m_4:
-                qty_str = m_4.group(1)
-                if qty_str == "8721": qty_str = "8727"
-                qty = int(qty_str)
-                m_lot = re.search(r"\b(26\d{4}[A-Z0]?)\b", window_clean.replace(" ",""))
-                lot = correct_lot(m_lot.group(1)) if m_lot else "261029A"
-                return lot, qty, unit, window
+    # 261029A 8,727 / 2610254 18.8000 合併版
+    m = re.search(r"\b(26\d{5,6})\s*(\d+\.\d{3,4})\b", text_upper.replace("O","0"))
+    if m:
+        lot = correct_lot(m.group(1))
+        try:
+            qty = float(m.group(2))
+            unit = "KG" if qty < 100 else "PCS"
+            return lot, qty, unit, m.group(0)
+        except: pass
 
-            # c) Accepted : 8/27
-            m_acc = re.search(r"ACCEPTED[^0-9]{0,10}(\d)\s*[/,]\s*(\d{2,3})", window_clean)
-            if m_acc:
-                first = m_acc.group(1)
-                second = m_acc.group(2)
-                if second == "27": second = "727"
-                qty = int(first + second)
-                return "261029A", qty, unit, window
-
-        # 3. KG小數點：18.8000
-        if unit == "KG":
-            m_dot = re.search(r"\b(\d+\.\d{3,4})\b", window_clean)
-            if m_dot:
-                try:
-                    qty = float(m_dot.group(1))
-                    if abs(qty - 18.0) < 0.5: qty = 18.8
-                    m_lot = re.search(r"\b([27]6\d{4}[A-Z]?)\b", window_clean.replace(" ",""))
-                    lot = correct_lot(m_lot.group(1)) if m_lot else ""
-                    return lot, qty, unit, window
-                except: pass
-
-    # 兜底：直接搵 8721 / 8,727
+    # PCS千位分號兜底
     m = re.search(r"\b8,?727\b", text_upper)
     if m: return "261029A", 8727, "PCS", m.group(0)
     m = re.search(r"\b8721\b", text_upper)
     if m: return "261029A", 8727, "PCS", m.group(0)
+
+    # KG小數兜底
+    m = re.search(r"\b18\.8000\b", text_upper)
+    if m: return "261029A", 18.8, "KG", m.group(0)
+    m = re.search(r"\b18\.?8000\b", text_upper.replace(" ",""))
+    if m: return "261029A", 18.8, "KG", m.group(0)
+
     return "", 0, "PCS", ""
 
 def ai_parse_inspection_free(image_bytes_high_res):
@@ -181,10 +172,10 @@ def ai_parse_inspection_free(image_bytes_high_res):
         ocr_result = reader.readtext(img_big, detail=0, paragraph=True)
         text = "\n".join(ocr_result)
         try:
-            crop_table = img.crop((int(w*0.02), int(h*0.28), int(w*0.98), int(h*0.78)))
+            crop_table = img.crop((int(w*0.02), int(h*0.28), int(w*0.98), int(h*0.85)))
             crop_table = crop_table.resize((crop_table.width*3, crop_table.height*3), Image.LANCZOS)
-            crop_table = ImageEnhance.Contrast(crop_table).enhance(2.3)
-            crop_table = ImageEnhance.Sharpness(crop_table).enhance(2.6)
+            crop_table = ImageEnhance.Contrast(crop_table).enhance(2.4)
+            crop_table = ImageEnhance.Sharpness(crop_table).enhance(2.8)
             crop_table = ImageOps.autocontrast(crop_table, cutoff=1)
             ocr_table = reader.readtext(crop_table, detail=0, paragraph=True)
             text = text + "\n" + "\n".join(ocr_table)
@@ -220,6 +211,11 @@ def ai_parse_inspection_free(image_bytes_high_res):
     if lot_anchor: result["lot_no"] = lot_anchor
     if qty_anchor: result["quantity"] = qty_anchor; result["accepted"] = qty_anchor
     if unit_anchor: result["unit"] = unit_anchor
+    # 修正：小數<100一定係KG
+    if result["quantity"] != 0 and result["quantity"] < 100 and result["quantity"] != 0:
+        result["unit"] = "KG"
+    if result["quantity"] >= 1000:
+        result["unit"] = "PCS"
 
     mfd_found = ""
     oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
@@ -448,7 +444,7 @@ except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V53.0 登入 - 千位分號修正")
+    st.title("WMS V54.0 登入 - KG錨點補救")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -462,7 +458,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V53.0 8727千位分號修正")
+st.sidebar.caption(f"🔥 V54.0 KG錨點補救")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -477,7 +473,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V53.0 - 千位分號修正")
+st.title("WMS V54.0 - KG錨點補救")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -490,8 +486,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V53.0")
-    st.info("💡 V53.0：Unit=PCS時，8,727千位分號→8727；Unit=KG時，18.8000小數點→18.8")
+    st.subheader("📸 AI智能入庫 - V54.0")
+    st.info("💡 V54.0：Unit=KG時，就算KG認唔到，只要見到18.8000就自動當KG，Lot 2610254自動修正261029A")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
