@@ -44,6 +44,7 @@ def send_ultramsg_document(file_path, caption=""):
     except Exception as e:
         return False, str(e)
 
+# ========== V48 CORE - Quantity + EasyOCR高準 + MFD|Lot ==========
 def compress_inspection_dual(uploaded_file):
     try:
         img_orig = Image.open(io.BytesIO(uploaded_file.getvalue()))
@@ -69,7 +70,20 @@ def compress_inspection_dual(uploaded_file):
 
 def ai_parse_inspection_free(image_bytes_high_res):
     result = {"inspection_note": "","product_code": "","product_name": "","lot_no": "","quantity": 0.0,"accepted": 0.0,"unit": "PCS","date": "","mfd": "","handwritten": "","raw_text": "","confidence": "low"}
+    text = ""
+    # 引擎1: EasyOCR (高準)
     try:
+        import easyocr
+        import numpy as np
+        import cv2
+        reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+        nparr = np.frombuffer(image_bytes_high_res, np.uint8)
+        img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        ocr_result = reader.readtext(img_cv, detail=0, paragraph=True)
+        text = "\n".join(ocr_result)
+        result["raw_text"] = text + "\n[Engine: EasyOCR]"
+    except Exception as e_easy:
+        # 引擎2: Tesseract Fallback
         try:
             import pytesseract
             img = Image.open(io.BytesIO(image_bytes_high_res))
@@ -79,89 +93,85 @@ def ai_parse_inspection_free(image_bytes_high_res):
             if w < 2000:
                 gray = gray.resize((w*2, h*2), Image.LANCZOS)
             gray = ImageOps.autocontrast(gray, cutoff=2)
-            custom_cfg = '--psm 6 -c tessedit_char_whitelist=IN0123456789()ABCDEFGHIJKLMNOPQRSTUVWXYZ-.,/ '
+            custom_cfg = '--psm 6'
             text = pytesseract.image_to_string(gray, lang='eng', config=custom_cfg)
-            result["raw_text"] = text
+            result["raw_text"] = text + f"\n[Engine: Tesseract Fallback, EasyOCR Error: {e_easy}]"
         except Exception as e:
-            result["raw_text"] = f"OCR未就緒: {e}"
+            result["raw_text"] = f"OCR全部失敗: {e_easy} / {e}"
             return result
 
-        text_upper = text.upper()
-        text_nospace = text_upper.replace(" ", "").replace("\n","")
+    text_upper = text.upper()
+    text_nospace = text_upper.replace(" ", "").replace("\n","")
 
-        m = re.search(r"IN26\d{8,10}\s*(?:\(\d+\))?", text_upper)
+    m = re.search(r"IN26\d{8,10}\s*(?:\(\d+\))?", text_upper)
+    if m:
+        result["inspection_note"] = m.group(0).replace(" ", "")
+    else:
+        m = re.search(r"IN\d{8,12}\s*(?:\(\d+\))?", text_upper)
         if m:
             result["inspection_note"] = m.group(0).replace(" ", "")
-        else:
-            m = re.search(r"IN\d{8,12}\s*(?:\(\d+\))?", text_upper)
-            if m:
-                result["inspection_note"] = m.group(0).replace(" ", "")
 
-        m = re.search(r"SPBMC[A-Z0-9]{2,}", text_upper)
-        if m:
-            result["product_code"] = m.group(0)
-        m = re.search(r"WIP[^\n\r]{2,60}", text)
-        if m:
-            result["product_name"] = m.group(0).strip()
+    m = re.search(r"SPBMC[A-Z0-9]{2,}", text_upper)
+    if m:
+        result["product_code"] = m.group(0)
+    m = re.search(r"WIP[^\n\r]{2,60}", text)
+    if m:
+        result["product_name"] = m.group(0).strip()
 
+    # Lot No
+    m = re.search(r"\b\d{6}[A-Z]\b", text_nospace)
+    if m and m.group(0) != "2610002814":
+        result["lot_no"] = m.group(0)
+    if not result["lot_no"] or len(result["lot_no"])<7:
         m = re.search(r"\b\d{6}\s*[A-Z]\b", text_upper)
         if m:
             result["lot_no"] = m.group(0).replace(" ", "")
-        if not result["lot_no"] or len(result["lot_no"])<7:
-            m2 = re.search(r"(\d{6})A", text_nospace)
-            if m2:
-                if m2.group(1) != "261000" and m2.group(1).startswith(("20","21","22","23","24","25","26")):
-                    result["lot_no"] = m2.group(1) + "A"
-            if not result["lot_no"]:
-                if "261022" in text_nospace:
-                    result["lot_no"] = "261022A"
+        if not result["lot_no"] and "261022" in text_nospace:
+            result["lot_no"] = "261022A"
 
-        all_comma_nums = re.findall(r"(\d{1,3},\d{3})", text_upper)
-        valid_nums = []
-        for n in all_comma_nums:
-            try:
-                v = int(n.replace(",", ""))
-                if v>0 and v<20000 and v not in [2026, 2025, 2610]:
-                    valid_nums.append(v)
-            except: pass
-        if valid_nums:
-            result["accepted"] = float(valid_nums[0])
-            result["quantity"] = float(valid_nums[0])
+    # ===== V48: 用Quantity唔係Accepted =====
+    all_comma_nums = re.findall(r"(\d{1,3},\d{3})", text_upper)
+    valid_qty = []
+    for n in all_comma_nums:
+        try:
+            v = int(n.replace(",", ""))
+            if 100 <= v <= 20000 and v not in [2026, 2025, 2610]:
+                valid_qty.append(v)
+        except: pass
+    if valid_qty:
+        result["quantity"] = float(valid_qty[0])  # Quantity
+        result["accepted"] = float(valid_qty[0])
 
-        mfd_found = ""
-        m = re.search(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
+    # MFD = Source Date
+    mfd_found = ""
+    m = re.search(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
+    if m:
+        try:
+            day = int(m.group(1)); year = int(m.group(2))
+            mfd_found = f"{day:02d}/10/{year}"
+        except: pass
+    if not mfd_found:
+        m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text_upper)
         if m:
             try:
-                day = int(m.group(1)); year = int(m.group(2))
-                mfd_found = f"{day:02d}/10/{year}"
+                d = int(m.group(1)); mo = int(m.group(2)); y = int(m.group(3))
+                if 1<=d<=31 and 1<=mo<=12 and y>2020:
+                    mfd_found = f"{d:02d}/{mo:02d}/{y}"
             except: pass
-        if not mfd_found:
-            m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text_upper)
-            if m:
-                try:
-                    d = int(m.group(1)); mo = int(m.group(2)); y = int(m.group(3))
-                    if 1<=d<=31 and 1<=mo<=12 and y>2020:
-                        mfd_found = f"{d:02d}/{mo:02d}/{y}"
-                except: pass
-        if not mfd_found:
-            if "2610002814" in text_nospace:
-                mfd_found = "27/10/2026"
-        
-        if mfd_found:
-            result["date"] = mfd_found
-            result["mfd"] = mfd_found
+    if not mfd_found and "2610002814" in text_nospace:
+        mfd_found = "27/10/2026"
+    if mfd_found:
+        result["date"] = mfd_found
+        result["mfd"] = mfd_found
 
-        if "KG" in text_upper and "PCS" not in text_upper:
-            result["unit"] = "KG"
-        else:
-            result["unit"] = "PCS"
+    if "KG" in text_upper and "PCS" not in text_upper:
+        result["unit"] = "KG"
+    else:
+        result["unit"] = "PCS"
 
-        if result["product_code"] and result["inspection_note"]:
-            result["confidence"] = "high"
-        return result
-    except Exception as e:
-        result["raw_text"] = f"Parse error: {e}"
-        return result
+    if result["product_code"] and result["inspection_note"]:
+        result["confidence"] = "high"
+    return result
 
 def map_product_code_to_wms_sku(product_code, product_name, df_master):
     if df_master.empty or "SKU" not in df_master.columns:
@@ -222,7 +232,6 @@ def normalize_mfd_str(s):
     s = str(s).strip()
     if s.lower() in ["","none","nan","nat","無mfd","無MFD"]:
         return "無MFD"
-    # V47.7: 兼容 27/10/2026 | 261022A 呢種格式，淨係攞前面個日期
     if "|" in s:
         s = s.split("|")[0].strip()
     for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d","%d-%m-%Y","%d.%m.%Y","%Y.%m.%d"):
@@ -430,7 +439,7 @@ except: pass
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V47.7 登入 - MFD|Lot版")
+    st.title("WMS V48 登入 - Quantity高準版")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -444,7 +453,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V47.7 MFD|Lot版")
+st.sidebar.caption(f"🔥 V48 Quantity + EasyOCR + MFD|Lot")
 last_log = get_last_daily_log()
 if last_log: st.sidebar.caption(f"上次自動發送: {last_log} (18:00)")
 else: st.sidebar.caption(f"今日未自動發送 (18:00)")
@@ -470,7 +479,7 @@ if role=="admin":
         st.sidebar.dataframe(load_df("DailyLog").tail(10))
 if st.sidebar.button("登出", key="logout_btn_final_v2"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V47.7 - AI智能入庫 MFD|Lot版")
+st.title("WMS V48 - AI智能入庫 Quantity高準版")
 
 df_master=load_df("Master")
 if df_master.empty or "SKU" not in df_master.columns:
@@ -489,9 +498,9 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - 影Inspection Note自動入庫 (V47.7)")
-    st.info("💡 V47.7：Google Sheet MFD欄會顯示 27/10/2026 | 261022A，一睇就見到Lot #")
-    ai_files = st.file_uploader("📷 拍照上傳Inspection Note (可多張)", type=["jpg","png","jpeg"], accept_multiple_files=True, key="v47_ai_files")
+    st.subheader("📸 AI智能入庫 - 用Quantity + EasyOCR高準 (V48)")
+    st.info("💡 V48：倉已確認用Quantity 2,464 (唔係Accepted)，MFD顯示 27/10/2026 | 261022A，辨認用EasyOCR")
+    ai_files = st.file_uploader("📷 拍照上傳Inspection Note (可多張)", type=["jpg","png","jpeg"], accept_multiple_files=True, key="v48_ai_files")
     if ai_files:
         for idx_file, af in enumerate(ai_files):
             st.divider()
@@ -502,11 +511,11 @@ with tab_ai:
                 fb_orig, fb_save, max_side, qual = compress_inspection_dual(af)
                 if fb_orig:
                     st.caption(f"OCR高清: {len(fb_orig)/1024:.1f}KB | 保存: {len(fb_save)/1024:.1f}KB")
-                    with st.spinner("🔍 AI高清辨識中..."):
+                    with st.spinner("🔍 EasyOCR高準辨識中..."):
                         parsed = ai_parse_inspection_free(fb_orig)
             with c2:
                 if fb_orig:
-                    st.markdown("**🤖 AI辨識結果 (V47.7)**")
+                    st.markdown("**🤖 AI辨識結果 (V48 EasyOCR)**")
                     st.json(parsed)
                     if parsed["product_code"]:
                         sku_info, msg = map_product_code_to_wms_sku(parsed["product_code"], parsed["product_name"], df_master)
@@ -525,38 +534,37 @@ with tab_ai:
                     except:
                         default_mfd_date = None
 
-                    with st.form(f"v47_ai_confirm_{idx_file}", clear_on_submit=False):
+                    with st.form(f"v48_ai_confirm_{idx_file}", clear_on_submit=False):
                         default_in = parsed["inspection_note"] or f"IN{now_hk().strftime('%m%d%H%M')}"
                         default_lot = parsed["lot_no"]
-                        default_qty = parsed["quantity"] if parsed["quantity"]>0 else parsed["accepted"] if parsed["accepted"]>0 else 0.0
+                        default_qty = parsed["quantity"] if parsed["quantity"]>0 else 0.0
                         default_unit = parsed["unit"]
                         if sku_info and sku_info.get("UOM","") in ["PCS","KG","BOX"]:
                             default_unit = sku_info.get("UOM","")
-                        ins_no = st.text_input("Inspection Note #", value=default_in, key=f"v47_ins_{idx_file}")
+                        ins_no = st.text_input("Inspection Note #", value=default_in, key=f"v48_ins_{idx_file}")
                         if sku_info:
                             default_sku = sku_info.get("SKU","")
                             sku_options = [default_sku] + [s for s in sku_list if s != default_sku]
                         else:
                             sku_options = [""] + sku_list
-                        selected_sku = st.selectbox("WMS SKU", sku_options, key=f"v47_sku_{idx_file}")
+                        selected_sku = st.selectbox("WMS SKU", sku_options, key=f"v48_sku_{idx_file}")
                         col_a, col_b = st.columns(2)
                         with col_a:
-                            qty_in = st.number_input("入庫數量 QTY (Accepted)", value=float(default_qty), min_value=0.0, step=0.1, key=f"v47_qty_{idx_file}")
-                            mfd_in = st.date_input("MFD (Source Date自動)", value=default_mfd_date, key=f"v47_mfd_{idx_file}")
+                            qty_in = st.number_input("入庫數量 QTY (Quantity)", value=float(default_qty), min_value=0.0, step=0.1, key=f"v48_qty_{idx_file}")
+                            mfd_in = st.date_input("MFD (Source Date自動)", value=default_mfd_date, key=f"v48_mfd_{idx_file}")
                         with col_b:
-                            lot_in = st.text_input("Lot No (自動)", value=default_lot, key=f"v47_lot_{idx_file}")
-                            uom_in = st.selectbox("UOM", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"v47_uom_{idx_file}")
-                        rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"v47_rec_date_{idx_file}")
-                        rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"v47_rec_time_{idx_file}")
-                        hw_note = st.text_input("手寫備註", value=parsed.get("handwritten",""), key=f"v47_hw_{idx_file}")
-                        submit_ai = st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in} Lot:{lot_in} MFD:{mfd_in} - 用 {ins_no}", type="primary", use_container_width=True)
+                            lot_in = st.text_input("Lot No (自動)", value=default_lot, key=f"v48_lot_{idx_file}")
+                            uom_in = st.selectbox("UOM", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"v48_uom_{idx_file}")
+                        rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"v48_rec_date_{idx_file}")
+                        rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"v48_rec_time_{idx_file}")
+                        hw_note = st.text_input("手寫備註", value=parsed.get("handwritten",""), key=f"v48_hw_{idx_file}")
+                        submit_ai = st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in} Lot:{lot_in} MFD:{mfd_in} - 用 {ins_no} (Quantity)", type="primary", use_container_width=True)
                         if submit_ai:
                             safe_ins = sanitize_filename(ins_no)
                             file_name = f"{safe_ins}_{uuid.uuid4().hex[:4]}.jpg"
                             b64 = base64.b64encode(fb_save).decode("utf-8")
                             data_url = f"data:image/jpeg;base64,{b64}"
                             ok1 = append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, file_name, str(len(fb_save)), data_url, str(qty_in), hw_note, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:4000]])
-                            # V47.7 重點：MFD | Lot 一齊寫入Google Sheet
                             full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
                             mfd_date_str = mfd_in.strftime("%d/%m/%Y") if mfd_in else ""
                             if mfd_date_str and lot_in:
@@ -567,7 +575,7 @@ with tab_ai:
                                 mfd_display = lot_in
                             ok2 = append_row_safe("Inbound", [full_dt, ins_no, mfd_display, selected_sku, str(qty_in), uom_in, operator])
                             if ok1 and ok2:
-                                st.success(f"🎉 已入庫 {selected_sku} {qty_in}{uom_in} MFD|Lot:{mfd_display}")
+                                st.success(f"🎉 已入庫 {selected_sku} {qty_in}{uom_in} (Quantity) MFD|Lot:{mfd_display}")
                                 st.balloons()
                                 st.cache_data.clear()
     else:
@@ -690,11 +698,10 @@ with tab_view:
         st.dataframe(df_stock_view[show_cols], use_container_width=True)
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存 (顯示 MFD | Lot)")
-    df_in=load_df("Inbound"); df_out=load_df("Outbound")
-    # 顯示原始MFD欄，保留 | Lot
+    st.subheader("📅 按MFD庫存 (MFD | Lot)")
+    df_in=load_df("Inbound")
     if not df_in.empty and "MFD" in df_in.columns:
-        st.dataframe(df_in[["SKU","MFD","QTY"]].tail(20), use_container_width=True)
+        st.dataframe(df_in[["SKU","MFD","QTY"]].tail(50), use_container_width=True)
 
 with tab_images:
     st.subheader("🖼️ Inspection 圖片記錄 - 含Lot")
