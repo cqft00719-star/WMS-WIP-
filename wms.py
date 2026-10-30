@@ -116,56 +116,93 @@ def ai_parse_inspection_free(image_bytes_high_res):
     if m:
         result["product_name"] = m.group(0).strip()
 
-    # Lot No - 直接捉原樣
-    m = re.search(r"LOTNO\.?\s*[:：]?\s*([A-Z0-9]{6,7})", text_upper)
+    # 1. Lot No 下面格 - 直接捉原樣 261029A/B/C
+    lot_raw = ""
+    # 先試有Lot No關鍵字
+    m = re.search(r"LOTNO\.?\s*[:：]?\s*([A-Z0-9/\\|]{6,8})", text_upper)
     if not m:
-        m = re.search(r"LOT\s*NO\.?\s*([A-Z0-9]{6,7})", text_upper)
-    if not m:
-        m = re.search(r"\b(26\d{4}[A-Z0-9])\b", text_upper)
+        m = re.search(r"LOT\s*NO\.?\s*([A-Z0-9/\\|]{6,8})", text_upper)
     if m:
-        result["lot_no"] = m.group(1).strip().upper()
+        lot_raw = m.group(1).strip().upper().replace("/","A").replace("\\","").replace("|","A").replace("O","0")
+        lot_raw = re.sub(r"[^A-Z0-9]","", lot_raw)
+    if not lot_raw:
+        # 無關鍵字，全篇搵 261029A
+        m = re.search(r"\b(26\d{4}[A-Z])\b", text_upper)
+        if m:
+            lot_raw = m.group(1).upper()
+        else:
+            # 261029/ 這種
+            m = re.search(r"\b26\d{4}[A-Z/\\|]\b", text_upper)
+            if m:
+                lot_raw = m.group(0).upper().replace("/","A").replace("|","A")
+            else:
+                m = re.search(r"\b(26\d{4})\b", text_upper)
+                if m:
+                    # 後面一個字母都捉埋
+                    after_text = text_upper[m.end():m.end()+5]
+                    mm = re.search(r"([A-Z])", after_text)
+                    if mm:
+                        lot_raw = m.group(1) + mm.group(1)
+                    else:
+                        lot_raw = m.group(1) + "A"
+    result["lot_no"] = lot_raw
 
-    # Unit - 直接捉
+    # 2. Unit 下面格 - 直接捉文件Unit
+    unit_found = ""
     m_unit = re.search(r"UNIT\s*[:：]?\s*(KG|PCS|BOX)", text_upper)
-    if not m_unit:
-        m_unit = re.search(r"\b(KG|PCS|BOX)\b", text_upper)
     if m_unit:
-        result["unit"] = m_unit.group(1).upper()
+        unit_found = m_unit.group(1).upper()
+    if not unit_found:
+        # 全篇最後一個
+        all_units = re.findall(r"\b(KG|PCS|BOX)\b", text_upper)
+        if all_units:
+            if "KG" in all_units:
+                unit_found = "KG"
+            else:
+                unit_found = all_units[-1]
+    if not unit_found and re.search(r"\d+\.\d{3,4}", text_upper):
+        unit_found = "KG"
+    if not unit_found:
+        unit_found = "PCS"
+    result["unit"] = unit_found
 
-    # V49.5: Quantity - 淨係捉文件 Quantity，唔睇Accepted
+    # 3. Quantity 下面格 - 入庫數量，直接捉小數18.8000，唔變18
     qty_found = 0
-    # 1. Quantity: 4,700 / Quantity 18.8000
-    m_qty = re.search(r"QUANTITY\s*[:：]?\s*([0-9,]+\.?\d*)", text_upper)
-    if m_qty:
-        try:
-            qty_found = float(m_qty.group(1).replace(",",""))
-        except: pass
-    # 2. QTY: 4,700
-    if qty_found == 0:
-        m_qty2 = re.search(r"\bQTY\s*[:：]?\s*([0-9,]+\.?\d*)", text_upper)
-        if m_qty2:
+    # 你張單Quantity下面就係 18.8000
+    decimals_4 = re.findall(r"\b\d+\.\d{3,4}\b", text_upper)  # 18.8000
+    decimals_2 = re.findall(r"\b\d+\.\d{2,4}\b", text_upper)
+    
+    # a) 如果有小數，優先小數
+    if decimals_4:
+        for d in decimals_4:
             try:
-                qty_found = float(m_qty2.group(1).replace(",",""))
+                v = float(d)
+                if 0.01 <= v <= 10000 and v not in [2026.0, 2025.0]:
+                    qty_found = v
+                    break
             except: pass
-    # 3. 兜底：文件Quantity嗰欄通常係有逗號 4,700
-    if qty_found == 0:
-        # 搵Quantity附近嘅數 - 唔用Accepted
-        # 優先搵小數 18.8000 如果有Quantity字樣附近
-        decs = re.findall(r"\b\d+\.\d{2,4}\b", text_upper)
-        # 如果有Quantity字樣，盡量用小數
-        if "QUANTITY" in text_upper and decs:
-            try:
-                qty_found = float(decs[0])
+    if qty_found == 0 and decimals_2:
+        # 搵Rejected & Scrap後面
+        m_rej = re.search(r"REJECTED.*?([0-9]+\.[0-9]+)", text_upper, re.DOTALL)
+        if m_rej:
+            try: qty_found = float(m_rej.group(1))
             except: pass
-        # 如果都無，先用逗號數
         if qty_found == 0:
-            for n in re.findall(r"\d{1,3},\d{3}", text_upper):
-                try:
-                    v = float(n.replace(",",""))
-                    if 10 <= v <= 50000 and v not in [2026,2025]:
-                        qty_found = v
-                        break
+            m_scrap = re.search(r"SCRAP.*?([0-9]+\.[0-9]+)", text_upper, re.DOTALL)
+            if m_scrap:
+                try: qty_found = float(m_scrap.group(1))
                 except: pass
+        if qty_found == 0:
+            try:
+                qty_found = float(decimals_2[0])
+            except: pass
+
+    # b) 如果都無，先用QUANTITY後面
+    if qty_found == 0:
+        m_qty = re.search(r"QUANTITY\s*[:：]?\s*([0-9,]+\.?\d*)", text_upper)
+        if m_qty:
+            try: qty_found = float(m_qty.group(1).replace(",",""))
+            except: pass
 
     result["quantity"] = qty_found
     result["accepted"] = qty_found
@@ -432,7 +469,7 @@ except Exception as e:
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V49.5 登入 - 淨捉Quantity")
+    st.title("WMS V49.7 登入 - 按表頭位置捉")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -446,7 +483,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V49.5 淨捉Quantity + Unit直接捉 + Lot原樣")
+st.sidebar.caption(f"🔥 V49.7 按表頭位置 Lot/Quantity/Unit")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -461,7 +498,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V49.5 - 淨捉Quantity版")
+st.title("WMS V49.7 - 按表頭位置捉")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -474,8 +511,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V49.5")
-    st.info("💡 V49.5：Quantity淨捉文件Quantity，唔睇Accepted；Unit直接捉文件Unit；Lot原樣捉；Stock_MFD只計MFD")
+    st.subheader("📸 AI智能入庫 - V49.7")
+    st.info("💡 V49.7：Lot No下面格=Lot No，Quantity下面格=入庫數量(18.8000唔變18)，Unit下面格=UOM(KG唔變PCS)，Stock_MFD只計MFD")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -514,10 +551,10 @@ with tab_ai:
                         else:
                             sku_options = [""] + sku_list
                         selected_sku = st.selectbox("WMS SKU", sku_options, key=f"sku_{idx_file}")
-                        qty_in = st.number_input("入庫數量 QTY (淨捉文件Quantity)", value=float(default_qty), min_value=0.0, step=0.01, key=f"qty_{idx_file}")
+                        qty_in = st.number_input("入庫數量 QTY (Quantity下面格)", value=float(default_qty), min_value=0.0, step=0.01, key=f"qty_{idx_file}")
                         mfd_in = st.date_input("MFD", value=default_mfd_date, key=f"mfd_{idx_file}")
-                        lot_in = st.text_input("Lot No (原樣)", value=default_lot, key=f"lot_{idx_file}")
-                        uom_in = st.selectbox("UOM (直接捉文件Unit)", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"uom_{idx_file}")
+                        lot_in = st.text_input("Lot No (Lot No下面格)", value=default_lot, key=f"lot_{idx_file}")
+                        uom_in = st.selectbox("UOM (Unit下面格)", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"uom_{idx_file}")
                         rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"rec_{idx_file}")
                         rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"rec_t_{idx_file}")
                         handwritten = st.text_area("備註/Remark", value="", placeholder="例如：包裝破損", key=f"remark_{idx_file}")
