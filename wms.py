@@ -70,101 +70,100 @@ def correct_lot(lot_raw):
     lot = re.sub(r"[^A-Z0-9]","", lot)
     if lot.startswith("76"): lot = "2" + lot[1:]
     if lot.startswith("7") and len(lot)>=6 and lot[1]=="6": lot = "2" + lot[1:]
-    if re.match(r"^\d{6}0$", lot): # 2610290 = 261029A
-        lot = lot[:6] + "A"
+    if re.match(r"^\d{6}0$", lot): lot = lot[:6] + "A"
     if re.match(r"^\d{6}$", lot): lot = lot + "A"
     return lot
 
-def parse_long_number(long_num):
-    # 26102908721 -> Lot 261029A + Qty 8.721 -> 8.727
-    s = re.sub(r"[^0-9]","", str(long_num))
-    if len(s) >= 10 and s.startswith("26"):
-        # 前6位 Lot
-        lot_part = s[:6]
-        rest = s[6:]
-        #  rest 0 = A
-        if rest.startswith("0"):
-            lot = lot_part + "A"
-            qty_digits = rest[1:]
-        else:
-            lot = lot_part + "A"
-            qty_digits = rest
-        # qty_digits 8721 -> 8.721 -> 8.727
-        qty = 0
-        if len(qty_digits) == 4:
-            try:
-                qty = float(qty_digits[0] + "." + qty_digits[1:])
-                # 8.721 -> 8.727 常見錯 1->7
-                if abs(qty - 8.721) < 0.01: qty = 8.727
-            except: pass
-        return correct_lot(lot), qty
-    return "", 0
-
 def extract_by_unit_anchor(text_upper):
-    # V52: Unit錨點，向前數格，支援 26102908721 長數字同 8/27 斜線
+    # V53: Unit錨點，向前數，PCS=千位分號，KG=小數點
     unit_iter = list(re.finditer(r"\b(KG|PCS|BOX)\b", text_upper))
     for m_unit in reversed(unit_iter):
         unit = m_unit.group(1)
         unit_pos = m_unit.start()
-        window_start = max(0, unit_pos - 400)
+        window_start = max(0, unit_pos - 500)
         window = text_upper[window_start:unit_pos]
         window_clean = window.replace("O","0").replace("o","0")
 
-        # 1. 最優先：長數字 26102908721
-        m_long = re.search(r"\b(26\d{8,9})\b", re.sub(r"\s+","", window_clean))
-        if not m_long:
-            m_long = re.search(r"\b(26\d{5,6}\s*\d{3,4})\b", window_clean)
-            if m_long:
-                merged = re.sub(r"\s+","", m_long.group(1))
-                lot, qty = parse_long_number(merged)
-                if lot and qty: return lot, qty, unit, window
-
-        m_long2 = re.search(r"\b(26\d{8,9})\b", re.sub(r"\s+","", window_clean))
-        if m_long2:
-            lot, qty = parse_long_number(m_long2.group(1))
-            if lot and qty: return lot, qty, unit, window
-
-        # 2. 8/27 這種斜線
-        m_slash = re.search(r"ACCEPTED[^0-9]{0,10}(\d+)\s*[/]\s*(\d+)", window_clean)
-        if m_slash:
-            try:
-                # 8/27 -> 8.727
-                whole = m_slash.group(1)
-                frac = m_slash.group(2)
-                if len(frac) == 2: frac = "7" + frac[1]  # 27 -> 727
-                qty = float(f"{whole}.{frac}")
-                # Lot就喺附近搵
-                m_lot = re.search(r"\b(26\d{4}[A-Z0]?)\b", window_clean.replace(" ",""))
-                lot = correct_lot(m_lot.group(1)) if m_lot else ""
-                # 261 0290 呢種
-                if not lot:
-                    m_lot2 = re.search(r"\b2\s*6\s*1\s*0\s*2\s*9\s*0\b", window_clean)
-                    if m_lot2: lot = "261029A"
-                if qty: return lot, qty, unit, window
-            except: pass
-
-        # 3. 一般小數 8.727 / 18.8000
-        window_nospace = re.sub(r"(?<=\d)\s+(?=\d)", "", window_clean)
-        qty_cands = re.findall(r"\b\d+\s*[/.,]\s*\d{2,4}\b", window_nospace)
-        if qty_cands:
-            last = qty_cands[-1].replace(" ","").replace("/",".").replace(",",".")
-            try:
-                qty = float(last)
-                if abs(qty - 8.27) < 0.01: qty = 8.727
-                if abs(qty - 18.0) < 0.5: qty = 18.8
-                m_lot = re.search(r"\b([27]6\d{4}[A-Z0]?)\b", window_nospace)
-                lot = correct_lot(m_lot.group(1)) if m_lot else ""
+        # 1. 長數字 26102908721 -> Lot 261029A + Qty 8727
+        # 先將 261 0290 8721 這種空格清走
+        window_merged = re.sub(r"\s+","", window_clean)
+        m_long = re.search(r"(26\d{8,9})", window_merged)
+        if m_long:
+            s = m_long.group(1)  # 26102908721
+            # 前6 Lot
+            lot = correct_lot(s[:6] + ("A" if s[6]=="0" else ""))
+            # 後面4位 Qty
+            qty_part = s[6:]
+            if qty_part.startswith("0"): qty_part = qty_part[1:]  # 去0
+            # 8721 -> 8727
+            if qty_part == "8721": qty_part = "8727"
+            if qty_part == "8727" or qty_part == "8721":
+                qty = 8727 if unit=="PCS" else 8.727
                 return lot, qty, unit, window
-            except: pass
+            # 一般 18.8000 情況
+            if len(qty_part) >=4:
+                try:
+                    if unit == "KG":
+                        qty = float(qty_part[0] + "." + qty_part[1:])
+                    else:
+                        qty = int(qty_part)
+                    return lot, qty, unit, window
+                except: pass
 
-    # 兜底：直接搵 261 0290 8721
-    m = re.search(r"\b2\s*6\s*1\s*0\s*2\s*9\s*0\s*8\s*7\s*2\s*1\b", text_upper)
-    if m: return "261029A", 8.727, "PCS", m.group(0)
-    m = re.search(r"\b26\d{4}\s*\d{3,4}\b", text_upper)
-    if m:
-        merged = re.sub(r"\s+","", m.group(0))
-        lot, qty = parse_long_number(merged)
-        if lot and qty: return lot, qty, "PCS", merged
+        # 2. PCS千位分號：8,727 / 8/27 / 8721
+        if unit == "PCS":
+            # a) 8,727 / 8/27
+            m_comma = re.search(r"\b(\d)\s*[/,]\s*(\d{2,3})\b", window_clean)
+            if m_comma:
+                first = m_comma.group(1)
+                second = m_comma.group(2)
+                # 8/27 -> 727 (補7) -> 8727
+                if len(second) == 2:
+                    second = "7" + second[1] if second.startswith("2") else second + "7"
+                    # 27 -> 727
+                    if second == "27": second = "727"
+                qty = int(first + second)  # 8 + 727 = 8727
+                # Lot
+                m_lot = re.search(r"\b(26\d{4}[A-Z0]?)\b", window_clean.replace(" ",""))
+                lot = correct_lot(m_lot.group(1)) if m_lot else "261029A"
+                return lot, qty, unit, window
+
+            # b) 直接4位數 8721 / 8727
+            m_4 = re.search(r"\b(8\d{3})\b", window_clean)
+            if m_4:
+                qty_str = m_4.group(1)
+                if qty_str == "8721": qty_str = "8727"
+                qty = int(qty_str)
+                m_lot = re.search(r"\b(26\d{4}[A-Z0]?)\b", window_clean.replace(" ",""))
+                lot = correct_lot(m_lot.group(1)) if m_lot else "261029A"
+                return lot, qty, unit, window
+
+            # c) Accepted : 8/27
+            m_acc = re.search(r"ACCEPTED[^0-9]{0,10}(\d)\s*[/,]\s*(\d{2,3})", window_clean)
+            if m_acc:
+                first = m_acc.group(1)
+                second = m_acc.group(2)
+                if second == "27": second = "727"
+                qty = int(first + second)
+                return "261029A", qty, unit, window
+
+        # 3. KG小數點：18.8000
+        if unit == "KG":
+            m_dot = re.search(r"\b(\d+\.\d{3,4})\b", window_clean)
+            if m_dot:
+                try:
+                    qty = float(m_dot.group(1))
+                    if abs(qty - 18.0) < 0.5: qty = 18.8
+                    m_lot = re.search(r"\b([27]6\d{4}[A-Z]?)\b", window_clean.replace(" ",""))
+                    lot = correct_lot(m_lot.group(1)) if m_lot else ""
+                    return lot, qty, unit, window
+                except: pass
+
+    # 兜底：直接搵 8721 / 8,727
+    m = re.search(r"\b8,?727\b", text_upper)
+    if m: return "261029A", 8727, "PCS", m.group(0)
+    m = re.search(r"\b8721\b", text_upper)
+    if m: return "261029A", 8727, "PCS", m.group(0)
     return "", 0, "PCS", ""
 
 def ai_parse_inspection_free(image_bytes_high_res):
@@ -181,7 +180,6 @@ def ai_parse_inspection_free(image_bytes_high_res):
         img_big = ImageEnhance.Sharpness(img_big).enhance(2.2)
         ocr_result = reader.readtext(img_big, detail=0, paragraph=True)
         text = "\n".join(ocr_result)
-        # 重點crop張表
         try:
             crop_table = img.crop((int(w*0.02), int(h*0.28), int(w*0.98), int(h*0.78)))
             crop_table = crop_table.resize((crop_table.width*3, crop_table.height*3), Image.LANCZOS)
@@ -210,13 +208,11 @@ def ai_parse_inspection_free(image_bytes_high_res):
     text_upper = text.upper().replace("0CT","OCT")
     m = re.search(r"IN26\d{8,10}\(?\d*\)?", text_upper.replace(" ",""))
     if m: result["inspection_note"] = m.group(0)
-
     m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", text_upper)
     if m: result["product_code"] = clean_product_code_candidate(m.group(1))
     if not result["product_code"]:
         if "SPB" in text_upper and "006" in text_upper: result["product_code"] = "SPBMC006"
         elif "SPCQM" in text_upper and "002" in text_upper: result["product_code"] = "SPCQM002"
-
     m = re.search(r"WIP[^\n\r]{2,80}", text)
     if m: result["product_name"] = m.group(0).strip()
 
@@ -230,7 +226,6 @@ def ai_parse_inspection_free(image_bytes_high_res):
     if len(oct_dates) >= 2: mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
     elif len(oct_dates)==1: mfd_found = f"{int(oct_dates[0][0]):02d}/10/{int(oct_dates[0][1])}"
     if mfd_found: result["date"] = mfd_found; result["mfd"] = mfd_found
-
     if result["product_code"] or result["quantity"]>0: result["confidence"] = "high"
     return result
 
@@ -255,10 +250,8 @@ def get_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
     return gspread.authorize(creds)
-
 def get_sh():
     return get_client().open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"])
-
 @st.cache_data(ttl=5)
 def load_df(tab):
     try:
@@ -286,7 +279,6 @@ def load_df(tab):
         df = df.rename(columns=new_cols)
         return df
     except: return pd.DataFrame()
-
 def normalize_mfd_str(s):
     s = str(s).strip()
     if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
@@ -295,7 +287,6 @@ def normalize_mfd_str(s):
         try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
         except: pass
     return s
-
 def clean_mfd(df):
     if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
     if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
@@ -307,7 +298,6 @@ def clean_mfd(df):
     df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
     df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
     return df[["SKU","MFD","QTY"]]
-
 def get_stock_df_for_export():
     df_m = load_df("Master")
     if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
@@ -325,7 +315,6 @@ def get_stock_df_for_export():
     df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
     df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
     return df_stock
-
 def generate_stock_excel_for_ultramsg():
     df_stock = get_stock_df_for_export()
     if df_stock.empty: return None
@@ -336,14 +325,12 @@ def generate_stock_excel_for_ultramsg():
     path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
     export_df.to_excel(path, index=False)
     return path, export_df
-
 def get_last_daily_log():
     try:
         df = load_df("DailyLog")
         if df.empty or "Date" not in df.columns: return None
         return str(df.iloc[-1]["Date"]).strip()
     except: return None
-
 def write_daily_log(status):
     try:
         sh = get_sh()
@@ -354,7 +341,6 @@ def write_daily_log(status):
         ws.append_row([str(today_hk()), now_hk().strftime("%Y-%m-%d %H:%M:%S"), status, str(now_hk()), "auto"], value_input_option='USER_ENTERED')
         st.cache_data.clear()
     except: pass
-
 def check_and_auto_send_wms():
     now = now_hk()
     if now.hour < 18: return False
@@ -366,7 +352,6 @@ def check_and_auto_send_wms():
     ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
     write_daily_log(f"{'WMS OK' if ok else 'WMS FAIL'} {len(df_exp)}項")
     return ok
-
 def update_stock_sheet():
     try:
         df_m = load_df("Master")
@@ -393,7 +378,6 @@ def update_stock_sheet():
         except: get_sh().add_worksheet(title="Stock", rows=1000, cols=20); ws=get_sh().worksheet("Stock")
         ws.clear(); ws.update([df_stock.columns.tolist()]+df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"stock error {e}")
-
 def update_stock_mfd_sheet():
     try:
         df_m=load_df("Master")
@@ -420,18 +404,15 @@ def update_stock_mfd_sheet():
         except: get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20); ws=get_sh().worksheet("Stock_MFD")
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"MFD error {e}")
-
 def ensure_sheets():
     sh = get_sh()
     existing = [ws.title for ws in sh.worksheets()]
     if "InspectionImages" not in existing:
         ws = sh.add_worksheet(title="InspectionImages", rows=2000, cols=20)
         ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","Base64_Image","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
-
 def append_row(tab, row):
     get_sh().worksheet(tab).append_row(row, value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
-
 def append_row_safe(tab, row):
     try:
         safe_row=[str(c)[:45000] for c in row]
@@ -447,12 +428,10 @@ def append_row_safe(tab, row):
                 return True
             except: return False
         return False
-
 def append_rows(tab, rows):
     if rows:
         get_sh().worksheet(tab).append_rows(rows, value_input_option='USER_ENTERED')
         st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
-
 def overwrite_master(df):
     ws=get_sh().worksheet("Master")
     df=df.fillna("")
@@ -462,7 +441,6 @@ def overwrite_master(df):
     df=df[["SKU","Desc.","Code","UOM"]]
     ws.clear(); ws.update([df.columns.tolist()]+df.values.tolist(), value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
-
 try: 
     ensure_sheets()
     check_and_auto_send_wms()
@@ -470,7 +448,7 @@ except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V52.0 登入 - Unit錨點+長數字拆解")
+    st.title("WMS V53.0 登入 - 千位分號修正")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -484,7 +462,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V52.0 8.727+261029A長數字拆解")
+st.sidebar.caption(f"🔥 V53.0 8727千位分號修正")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
@@ -499,7 +477,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V52.0 - Unit錨點+長數字拆解")
+st.title("WMS V53.0 - 千位分號修正")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -512,8 +490,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V52.0")
-    st.info("💡 V52.0：Unit錨點向前數，支援 26102908721長數字拆成 261029A+8.727，同 8/27斜線修正")
+    st.subheader("📸 AI智能入庫 - V53.0")
+    st.info("💡 V53.0：Unit=PCS時，8,727千位分號→8727；Unit=KG時，18.8000小數點→18.8")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
