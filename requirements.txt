@@ -6,3 +6,4 @@ openpyxl
 pytz
 requests
 Pillow
+pytesseract
