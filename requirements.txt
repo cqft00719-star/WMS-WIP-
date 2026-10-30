@@ -4,9 +4,5 @@ gspread
 google-auth
 openpyxl
 pytz
-google-api-python-client
-google-auth-httplib2
-pytesseract
+requests
 Pillow
-tesseract-ocr
-tesseract-ocr-eng
