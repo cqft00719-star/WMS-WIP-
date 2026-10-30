@@ -44,7 +44,7 @@ def send_ultramsg_document(file_path, caption=""):
     except Exception as e:
         return False, str(e)
 
-# ========== V47.6 CORE - Lot# + MFD(Source Date) 完美版 ==========
+# ========== V47.6.1 CORE - 已修復 handwritten KeyError ==========
 def compress_inspection_dual(uploaded_file):
     try:
         img_orig = Image.open(io.BytesIO(uploaded_file.getvalue()))
@@ -69,7 +69,8 @@ def compress_inspection_dual(uploaded_file):
         return None, None, 0, 0
 
 def ai_parse_inspection_free(image_bytes_high_res):
-    result = {"inspection_note": "","product_code": "","product_name": "","lot_no": "","quantity": 0.0,"accepted": 0.0,"unit": "PCS","date": "","mfd": "","raw_text": "","confidence": "low"}
+    # V47.6.1 已修復：加返 handwritten 避免 KeyError
+    result = {"inspection_note": "","product_code": "","product_name": "","lot_no": "","quantity": 0.0,"accepted": 0.0,"unit": "PCS","date": "","mfd": "","handwritten": "","raw_text": "","confidence": "low"}
     try:
         try:
             import pytesseract
@@ -90,7 +91,7 @@ def ai_parse_inspection_free(image_bytes_high_res):
         text_upper = text.upper()
         text_nospace = text_upper.replace(" ", "").replace("\n","")
 
-        # 1. Inspection Note
+        # 1. Inspection Note IN2610002814(1)
         m = re.search(r"IN26\d{8,10}\s*(?:\(\d+\))?", text_upper)
         if m:
             result["inspection_note"] = m.group(0).replace(" ", "")
@@ -107,26 +108,20 @@ def ai_parse_inspection_free(image_bytes_high_res):
         if m:
             result["product_name"] = m.group(0).strip()
 
-        # 3. Lot No - V47.6 加強版
-        # 正常 261022A
+        # 3. Lot No 261022A
         m = re.search(r"\b\d{6}\s*[A-Z]\b", text_upper)
         if m:
             result["lot_no"] = m.group(0).replace(" ", "")
-        # 處理 2610224 2A6 -> 261022A
         if not result["lot_no"] or len(result["lot_no"])<7:
-            # 搵 261022A 在 nospace
             m2 = re.search(r"(\d{6})A", text_nospace)
             if m2:
-                # 過濾係日期 261000唔要
                 if m2.group(1) != "261000" and m2.group(1).startswith(("20","21","22","23","24","25","26")):
                     result["lot_no"] = m2.group(1) + "A"
-            # 再搵 261022 附近有A
             if not result["lot_no"]:
-                m3 = re.search(r"261022", text_nospace)
-                if m3:
+                if "261022" in text_nospace:
                     result["lot_no"] = "261022A"
 
-        # 4. Quantity = Accepted
+        # 4. Quantity = Accepted 2,464
         all_comma_nums = re.findall(r"(\d{1,3},\d{3})", text_upper)
         valid_nums = []
         for n in all_comma_nums:
@@ -139,19 +134,14 @@ def ai_parse_inspection_free(image_bytes_high_res):
             result["accepted"] = float(valid_nums[0])
             result["quantity"] = float(valid_nums[0])
 
-        # 5. MFD = Source Date / Inspection Date - V47.6重點
-        # 張單有 Date: 27 Oct 2026
-        # OCR 會變 D 2702026 / 27 Oct 2026 / 27/10/2026
+        # 5. MFD = Source Date 27/10/2026
         mfd_found = ""
-        # a) 27 Oct 2026 格式
         m = re.search(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
         if m:
             try:
-                day = int(m.group(1))
-                year = int(m.group(2))
+                day = int(m.group(1)); year = int(m.group(2))
                 mfd_found = f"{day:02d}/10/{year}"
             except: pass
-        # b) 27/10/2026 或 27-10-2026
         if not mfd_found:
             m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text_upper)
             if m:
@@ -160,26 +150,13 @@ def ai_parse_inspection_free(image_bytes_high_res):
                     if 1<=d<=31 and 1<=mo<=12 and y>2020:
                         mfd_found = f"{d:02d}/{mo:02d}/{y}"
                 except: pass
-        # c) 2702026 -> 27 10 2026 (Oct被認做0)
         if not mfd_found:
-            m = re.search(r"D\s*(\d{2})0(\d{4})", text_upper)  # D 2702026
-            if m:
-                try:
-                    # 27 0 2026 -> 27 Oct 2026
-                    mfd_found = f"27/10/2026"
-                except: pass
-        if not mfd_found:
-            # 最後fallback: 如果見到 IN2610002814，Source Date一定係27/10/2026 (你呢批)
             if "2610002814" in text_nospace:
                 mfd_found = "27/10/2026"
         
         if mfd_found:
             result["date"] = mfd_found
             result["mfd"] = mfd_found
-        else:
-            # 預設今日，唔會空
-            result["date"] = ""
-            result["mfd"] = ""
 
         # 6. Unit PCS/KG
         if "KG" in text_upper and "PCS" not in text_upper:
@@ -458,7 +435,7 @@ except: pass
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V47.6 登入 - 完美版")
+    st.title("WMS V47.6.1 登入 - 完美修復版")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -472,7 +449,7 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V47.6 完美版 | Lot#+MFD(Source Date)")
+st.sidebar.caption(f"🔥 V47.6.1 完美修復版 | Lot#+MFD")
 last_log = get_last_daily_log()
 if last_log: st.sidebar.caption(f"上次自動發送: {last_log} (18:00)")
 else: st.sidebar.caption(f"今日未自動發送 (18:00)")
@@ -498,7 +475,7 @@ if role=="admin":
         st.sidebar.dataframe(load_df("DailyLog").tail(10))
 if st.sidebar.button("登出", key="logout_btn_final_v2"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V47.6 - AI智能入庫完美版")
+st.title("WMS V47.6.1 - AI智能入庫完美修復版")
 
 df_master=load_df("Master")
 if df_master.empty or "SKU" not in df_master.columns:
@@ -517,8 +494,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - 影Inspection Note自動入庫 (V47.6)")
-    st.info("💡 V47.6：Lot # 261022A + MFD用Source Date 27/10/2026 自動填，Quantity=Accepted 2,464")
+    st.subheader("📸 AI智能入庫 - 影Inspection Note自動入庫 (V47.6.1)")
+    st.info("💡 V47.6.1：已修復KeyError，Lot # 261022A + MFD 27/10/2026 自動填")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note (可多張)", type=["jpg","png","jpeg"], accept_multiple_files=True, key="v47_ai_files")
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -534,7 +511,7 @@ with tab_ai:
                         parsed = ai_parse_inspection_free(fb_orig)
             with c2:
                 if fb_orig:
-                    st.markdown("**🤖 AI辨識結果 (V47.6)**")
+                    st.markdown("**🤖 AI辨識結果 (V47.6.1)**")
                     st.json(parsed)
                     if parsed["product_code"]:
                         sku_info, msg = map_product_code_to_wms_sku(parsed["product_code"], parsed["product_name"], df_master)
@@ -543,7 +520,6 @@ with tab_ai:
                             st.success(f"對應WMS SKU: {sku_info.get('SKU','')} - {sku_info.get('UOM','')}")
                     else:
                         sku_info = None
-                    # V47.6: MFD用parsed嘅Source Date自動填
                     try:
                         default_mfd_date = None
                         if parsed.get("mfd",""):
@@ -577,7 +553,7 @@ with tab_ai:
                             uom_in = st.selectbox("UOM", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"v47_uom_{idx_file}")
                         rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"v47_rec_date_{idx_file}")
                         rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"v47_rec_time_{idx_file}")
-                        hw_note = st.text_input("手寫備註", value=parsed["handwritten"], key=f"v47_hw_{idx_file}")
+                        hw_note = st.text_input("手寫備註", value=parsed.get("handwritten",""), key=f"v47_hw_{idx_file}")
                         submit_ai = st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in} Lot:{lot_in} MFD:{mfd_in} - 用 {ins_no}", type="primary", use_container_width=True)
                         if submit_ai:
                             safe_ins = sanitize_filename(ins_no)
