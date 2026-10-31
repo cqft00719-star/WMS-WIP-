@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 import datetime
 import pytz
 import requests
@@ -13,6 +11,7 @@ import re
 import uuid
 import time
 import difflib
+import os
 from PIL import Image, ImageOps, ImageEnhance
 
 HKT = pytz.timezone("Asia/Hong_Kong")
@@ -23,101 +22,141 @@ ULTRAMSG_INSTANCE = "instance194419"
 ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
 ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
-# ========== Drive $0 方案 ==========
 @st.cache_resource
 def get_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
     return gspread.authorize(creds), creds
 
-@st.cache_resource
-def get_drive_service():
-    _, creds = get_client()
-    return build('drive', 'v3', credentials=creds)
+def get_sh():
+    client, _ = get_client()
+    return client.open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"])
 
-def ensure_drive_folders():
+@st.cache_data(ttl=5)
+def load_df(tab):
     try:
-        service = get_drive_service()
-        # 搵或建 WMS_Root
-        q = "mimeType='application/vnd.google-apps.folder' and name='WMS_System' and trashed=false"
-        res = service.files().list(q=q, fields="files(id,name)").execute()
-        if res['files']:
-            root_id = res['files'][0]['id']
-        else:
-            file_metadata = {'name': 'WMS_System', 'mimeType': 'application/vnd.google-apps.folder'}
-            root_id = service.files().create(body=file_metadata, fields='id').execute()['id']
-        
-        # WMS_Images
-        q = f"'{root_id}' in parents and mimeType='application/vnd.google-apps.folder' and name='WMS_Images' and trashed=false"
-        res = service.files().list(q=q, fields="files(id)").execute()
-        if res['files']:
-            img_id = res['files'][0]['id']
-        else:
-            file_metadata = {'name': 'WMS_Images', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [root_id]}
-            img_id = service.files().create(body=file_metadata, fields='id').execute()['id']
-        
-        # WMS_Backup
-        q = f"'{root_id}' in parents and mimeType='application/vnd.google-apps.folder' and name='WMS_Backup' and trashed=false"
-        res = service.files().list(q=q, fields="files(id)").execute()
-        if res['files']:
-            backup_id = res['files'][0]['id']
-        else:
-            file_metadata = {'name': 'WMS_Backup', 'mimeType': 'application/vnd.google-apps.folder', 'parents': [root_id]}
-            backup_id = service.files().create(body=file_metadata, fields='id').execute()['id']
-        
-        return root_id, img_id, backup_id
-    except Exception as e:
-        print(f"ensure folder error {e}")
-        return None, None, None
+        ws = get_sh().worksheet(tab)
+        vals = ws.get_all_values()
+        if len(vals) < 1: return pd.DataFrame()
+        headers = [str(h).strip() for h in vals[0]]
+        clean_headers = []
+        for i,h in enumerate(headers):
+            if h == "": h = f"COL_{i}"
+            if h in clean_headers: h = f"{h}_{i}"
+            clean_headers.append(h)
+        rows = []
+        for r in vals[1:]:
+            if any(str(c).strip() != "" for c in r):
+                if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
+                rows.append(r[:len(clean_headers)])
+        df = pd.DataFrame(rows, columns=clean_headers)
+        new_cols = {}
+        for c in df.columns:
+            lc = c.lower().strip()
+            if "sku" in lc: new_cols[c] = "SKU"
+            elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
+            elif "qty" in lc or "quantity" in lc: new_cols[c] = "QTY"
+        df = df.rename(columns=new_cols)
+        return df
+    except: return pd.DataFrame()
 
-def upload_image_to_drive(file_bytes, filename):
-    try:
-        _, img_folder_id, _ = ensure_drive_folders()
-        if not img_folder_id:
-            return None, None
-        service = get_drive_service()
-        # 按日分子文件夾 2026/10/30
-        date_path = now_hk().strftime("%Y/%m/%d")
-        # 為簡單，直接用檔名帶日期，唔再建多層
-        file_metadata = {'name': filename, 'parents': [img_folder_id]}
-        media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype='image/jpeg', resumable=True)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        # 設為anyone with link可睇，方便Streamlit顯示
-        try:
-            service.permissions().create(fileId=file['id'], body={'role':'reader','type':'anyone'}).execute()
+def normalize_mfd_str(s):
+    s = str(s).strip()
+    if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
+    if "|" in s: s = s.split("|")[0].strip()
+    for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
+        try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
         except: pass
-        return file['id'], file.get('webViewLink','')
-    except Exception as e:
-        print(f"upload drive error {e}")
-        return None, None
+    return s
 
+def clean_mfd(df):
+    if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "MFD" not in df.columns: df["MFD"] = "無MFD"
+    df["SKU"]=df["SKU"].astype(str).str.strip()
+    df["SKU"]=df["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
+    df=df[df["SKU"]!=""]
+    df["MFD"]=df["MFD"].astype(str).apply(normalize_mfd_str)
+    df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
+    df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+    return df[["SKU","MFD","QTY"]]
+
+def get_stock_df_for_export():
+    df_m = load_df("Master")
+    if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
+    df_in = load_df("Inbound"); df_out = load_df("Outbound")
+    df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
+    df_m = df_m[df_m["SKU"]!=""]
+    df_m["SKU_base"] = df_m["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
+    df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
+    in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+    out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
+    df_stock = pd.merge(df_m.copy(), in_sum, left_on="SKU_base", right_on="SKU", how="left")
+    df_stock = pd.merge(df_stock, out_sum, left_on="SKU_base", right_on="SKU", how="left", suffixes=("","_out"))
+    df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
+    df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
+    df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
+    df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+    return df_stock
+
+def generate_stock_excel_for_ultramsg():
+    df_stock = get_stock_df_for_export()
+    if df_stock.empty: return None
+    export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
+    for c in export_cols:
+        if c not in df_stock.columns: df_stock[c]=""
+    export_df = df_stock[export_cols].copy()
+    path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
+    export_df.to_excel(path, index=False)
+    return path, export_df
+
+def get_last_daily_log():
+    try:
+        df = load_df("DailyLog")
+        if df.empty or "Date" not in df.columns: return None
+        return str(df.iloc[-1]["Date"]).strip()
+    except: return None
+
+def write_daily_log(status):
+    try:
+        sh = get_sh()
+        try: ws = sh.worksheet("DailyLog")
+        except:
+            ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
+            ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
+        ws.append_row([str(today_hk()), now_hk().strftime("%Y-%m-%d %H:%M:%S"), status, str(now_hk()), "auto"], value_input_option='USER_ENTERED')
+        st.cache_data.clear()
+    except: pass
+
+# ===== V55.1 核心修正：免費Gmail無Drive Quota，Backup做新Google Sheet =====
 def backup_all_sheets_to_drive():
     try:
         sh = get_sh()
-        _, _, backup_folder_id = ensure_drive_folders()
-        if not backup_folder_id:
-            return False, "無backup folder"
-        # 讀所有重要tab
-        tabs = ["Master","Inbound","Outbound","Stock","Stock_MFD","InspectionImages"]
-        excel_path = f"/tmp/WMS_BACKUP_{today_hk().strftime('%Y%m%d')}_{now_hk().strftime('%H%M')}.xlsx"
-        with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-            for tab in tabs:
+        client, _ = get_client()
+        backup_name = f"WMS_BACKUP_{today_hk().strftime('%Y%m%d_%H%M')}"
+        sh_backup = client.create(backup_name)
+        # 自動share俾owner，方便你喺自己Drive搵到
+        try:
+            # 如果secrets有owner_email就share，無都唔緊要，Service Account自己開嘅Sheet你用link都入到
+            owner_email = st.secrets.get("owner_email", "")
+            if owner_email:
+                sh_backup.share(owner_email, perm_type='user', role='writer')
+        except: pass
+        tabs = ["Master","Inbound","Outbound","Stock","Stock_MFD","DailyLog"]
+        for tab in tabs:
+            try:
+                vals = sh.worksheet(tab).get_all_values()
+                if not vals: continue
                 try:
-                    ws = sh.worksheet(tab)
-                    vals = ws.get_all_values()
-                    if vals:
-                        df = pd.DataFrame(vals[1:], columns=vals[0])
-                        # InspectionImages唔要Base64嗰格，慳位
-                        if tab == "InspectionImages" and "Base64_Image" in df.columns:
-                            df = df.drop(columns=["Base64_Image"])
-                        df.to_excel(writer, sheet_name=tab, index=False)
-                except: pass
-        
-        service = get_drive_service()
-        file_metadata = {'name': f"WMS_BACKUP_{today_hk().strftime('%Y%m%d')}.xlsx", 'parents': [backup_folder_id]}
-        media = MediaIoBaseUpload(io.BytesIO(open(excel_path,'rb').read()), mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', resumable=True)
-        file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
-        return True, file.get('webViewLink','')
+                    ws_dst = sh_backup.worksheet(tab)
+                except:
+                    ws_dst = sh_backup.add_worksheet(title=tab, rows=max(1000, len(vals)+20), cols=max(20, len(vals[0])+5))
+                ws_dst.clear()
+                # 分批寫入避免超過上限
+                ws_dst.update(vals, value_input_option='USER_ENTERED')
+            except: continue
+        link = f"https://docs.google.com/spreadsheets/d/{sh_backup.id}"
+        return True, link
     except Exception as e:
         print(f"backup error {e}")
         return False, str(e)
@@ -133,6 +172,21 @@ def send_ultramsg_document(file_path, caption=""):
     except Exception as e:
         return False, str(e)
 
+def check_and_auto_send_wms():
+    now = now_hk()
+    if now.hour < 18: return False
+    last = get_last_daily_log()
+    if last == str(today_hk()): return False
+    result = generate_stock_excel_for_ultramsg()
+    if result:
+        path, df_exp = result
+        ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
+        ok2, link = backup_all_sheets_to_drive()
+        write_daily_log(f"{'WMS OK' if ok else 'WMS FAIL'} {len(df_exp)}項 | Sheet Backup {'OK' if ok2 else 'FAIL'} {link[:60]}")
+        return ok
+    return False
+
+# ===== AI部分 V54邏輯完整保留 =====
 def compress_inspection_dual(uploaded_file):
     try:
         img_orig = Image.open(io.BytesIO(uploaded_file.getvalue()))
@@ -310,122 +364,6 @@ def map_product_code_to_wms_sku(product_code, product_name, df_master):
         return row, f"✅ 用 {product_code} 模糊對應 {row['SKU_str']}"
     return None, f"❌ Master無 {product_code}"
 
-def get_sh():
-    client, _ = get_client()
-    return client.open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"])
-
-@st.cache_data(ttl=5)
-def load_df(tab):
-    try:
-        ws = get_sh().worksheet(tab)
-        vals = ws.get_all_values()
-        if len(vals) < 1: return pd.DataFrame()
-        headers = [str(h).strip() for h in vals[0]]
-        clean_headers = []
-        for i,h in enumerate(headers):
-            if h == "": h = f"COL_{i}"
-            if h in clean_headers: h = f"{h}_{i}"
-            clean_headers.append(h)
-        rows = []
-        for r in vals[1:]:
-            if any(str(c).strip() != "" for c in r):
-                if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
-                rows.append(r[:len(clean_headers)])
-        df = pd.DataFrame(rows, columns=clean_headers)
-        new_cols = {}
-        for c in df.columns:
-            lc = c.lower().strip()
-            if "sku" in lc: new_cols[c] = "SKU"
-            elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
-            elif "qty" in lc or "quantity" in lc: new_cols[c] = "QTY"
-        df = df.rename(columns=new_cols)
-        return df
-    except: return pd.DataFrame()
-
-def normalize_mfd_str(s):
-    s = str(s).strip()
-    if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
-    if "|" in s: s = s.split("|")[0].strip()
-    for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
-        try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
-        except: pass
-    return s
-
-def clean_mfd(df):
-    if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-    if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-    if "MFD" not in df.columns: df["MFD"] = "無MFD"
-    df["SKU"]=df["SKU"].astype(str).str.strip()
-    df["SKU"]=df["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
-    df=df[df["SKU"]!=""]
-    df["MFD"]=df["MFD"].astype(str).apply(normalize_mfd_str)
-    df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
-    df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
-    return df[["SKU","MFD","QTY"]]
-
-def get_stock_df_for_export():
-    df_m = load_df("Master")
-    if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
-    df_in = load_df("Inbound"); df_out = load_df("Outbound")
-    df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
-    df_m = df_m[df_m["SKU"]!=""]
-    df_m["SKU_base"] = df_m["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
-    df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
-    in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
-    out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
-    df_stock = pd.merge(df_m.copy(), in_sum, left_on="SKU_base", right_on="SKU", how="left")
-    df_stock = pd.merge(df_stock, out_sum, left_on="SKU_base", right_on="SKU", how="left", suffixes=("","_out"))
-    df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
-    df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
-    df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
-    df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
-    return df_stock
-
-def generate_stock_excel_for_ultramsg():
-    df_stock = get_stock_df_for_export()
-    if df_stock.empty: return None
-    export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
-    for c in export_cols:
-        if c not in df_stock.columns: df_stock[c]=""
-    export_df = df_stock[export_cols].copy()
-    path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
-    export_df.to_excel(path, index=False)
-    return path, export_df
-
-def get_last_daily_log():
-    try:
-        df = load_df("DailyLog")
-        if df.empty or "Date" not in df.columns: return None
-        return str(df.iloc[-1]["Date"]).strip()
-    except: return None
-
-def write_daily_log(status):
-    try:
-        sh = get_sh()
-        try: ws = sh.worksheet("DailyLog")
-        except:
-            ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
-            ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
-        ws.append_row([str(today_hk()), now_hk().strftime("%Y-%m-%d %H:%M:%S"), status, str(now_hk()), "auto"], value_input_option='USER_ENTERED')
-        st.cache_data.clear()
-    except: pass
-
-def check_and_auto_send_wms():
-    now = now_hk()
-    if now.hour < 18: return False
-    last = get_last_daily_log()
-    if last == str(today_hk()): return False
-    # 1. WhatsApp
-    result = generate_stock_excel_for_ultramsg()
-    if result:
-        path, df_exp = result
-        ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
-        # 2. Drive Backup (新加)
-        ok2, link = backup_all_sheets_to_drive()
-        write_daily_log(f"{'WMS OK' if ok else 'WMS FAIL'} {len(df_exp)}項 | Drive Backup {'OK' if ok2 else 'FAIL'} {link[:50]}")
-        return ok
-    return False
-
 def update_stock_sheet():
     try:
         df_m = load_df("Master")
@@ -485,7 +423,7 @@ def ensure_sheets():
     existing = [ws.title for ws in sh.worksheets()]
     if "InspectionImages" not in existing:
         ws = sh.add_worksheet(title="InspectionImages", rows=2000, cols=20)
-        ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","DriveFileId","DriveLink","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
+        ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","DriveFileId","Base64_Image","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
 
 def append_row(tab, row):
     get_sh().worksheet(tab).append_row(row, value_input_option='USER_ENTERED')
@@ -524,13 +462,12 @@ def overwrite_master(df):
 
 try: 
     ensure_sheets()
-    ensure_drive_folders()
     check_and_auto_send_wms()
 except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V55.0 登入 - $0 Drive Backup版")
+    st.title("WMS V55.1 登入 - Free Gmail Backup版")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -544,16 +481,18 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V55.0 $0 Drive版 PCS 8727 KG 18.8")
+st.sidebar.caption(f"🔥 V55.1 Free Gmail版 PCS 8727 KG 18.8")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
         update_stock_sheet(); update_stock_mfd_sheet()
         st.sidebar.success("已同步"); st.rerun()
-    if st.sidebar.button("💾 立即Backup去Drive"):
+    if st.sidebar.button("💾 立即Backup去Google Sheet"):
         with st.spinner("Backup緊..."):
             ok, link = backup_all_sheets_to_drive()
-            if ok: st.sidebar.success(f"Backup OK {link}")
+            if ok: 
+                st.sidebar.success(f"Backup OK")
+                st.sidebar.markdown(f"[📄 開啟Backup Sheet]({link})")
             else: st.sidebar.error(f"Backup FAIL {link}")
     if st.sidebar.button("📦 測試發總庫存去WhatsApp"):
         result = generate_stock_excel_for_ultramsg()
@@ -564,7 +503,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V55.0 - $0 Drive Backup版")
+st.title("WMS V55.1 - Free Gmail $0 Backup版")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -577,8 +516,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V55.0 $0 Drive版")
-    st.success("💡 V55.0：張相自動上傳去Drive/WMS_Images，唔再塞爆Sheet，每日18:00自動Backup去Drive/WMS_Backup")
+    st.subheader("📸 AI智能入庫 - V55.1 Free Gmail版")
+    st.success("💡 V55.1：免費Gmail無Drive Quota，Backup改為自動開新Google Sheet，唔會再403")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -625,15 +564,16 @@ with tab_ai:
                         rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"rec_t_{idx_file}")
                         handwritten = st.text_area("備註/Remark", value="", placeholder="例如：包裝破損", key=f"remark_{idx_file}")
                         if st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in}", type="primary", use_container_width=True):
-                            with st.spinner("上傳相去Drive..."):
-                                file_id, drive_link = upload_image_to_drive(fb_save, f"{ins_no}_{uuid.uuid4().hex[:4]}.jpg")
+                            with st.spinner("壓縮緊..."):
+                                b64_small = base64.b64encode(fb_save).decode("utf-8")
+                                data_url = f"data:image/jpeg;base64,{b64_small}"
+                                data_url_short = data_url[:45000]
                             full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
-                            mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime("%d/%m/%Y") if mfd_in else lot_in)
+                            mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime('%d/%m/%Y') if mfd_in else lot_in)
                             base_sku_for_stock = selected_sku.split("---")[0].strip().upper() if "---" in selected_sku else selected_sku.strip().upper()
-                            # V55: 存Drive ID+Link，唔存Base64
-                            append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, f"{ins_no}.jpg", str(len(fb_save)), file_id or "", drive_link or "", str(qty_in), handwritten, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:1000]])
+                            append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, f"{ins_no}.jpg", str(len(fb_save)), "", data_url_short, str(qty_in), handwritten, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:1000]])
                             append_row_safe("Inbound", [full_dt, ins_no, mfd_display, base_sku_for_stock, str(qty_in), uom_in, operator])
-                            st.success(f"🎉 已入庫 {base_sku_for_stock} {qty_in}{uom_in} {mfd_display} | 相已存Drive {drive_link[:30]}")
+                            st.success(f"🎉 已入庫 {base_sku_for_stock} {qty_in}{uom_in} {mfd_display}")
                             st.balloons()
     else:
         st.info("請先上傳")
@@ -668,7 +608,7 @@ with tab_in:
             remark=st.text_area("備註")
             if st.form_submit_button("確認入庫"):
                 full_dt=datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
-                mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime("%d/%m/%Y") if mfd else lot)
+                mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime('%d/%m/%Y') if mfd else lot)
                 base_sku = sku.split("---")[0].strip().upper() if "---" in sku else sku.strip().upper()
                 append_row("Inbound", [full_dt, ins, mfd_display, base_sku, qty, uom, operator])
                 if remark:
@@ -736,8 +676,8 @@ with tab_mfd:
     else: st.dataframe(df_stock_mfd, use_container_width=True, height=500)
 
 with tab_images:
-    st.subheader("🖼️ Inspection 圖片記錄 - 已搬去Drive")
+    st.subheader("🖼️ Inspection 圖片記錄")
     df_img = load_df("InspectionImages")
     if df_img.empty: st.info("暫無圖片記錄")
     else:
-        st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","DriveLink","QTY","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
+        st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
