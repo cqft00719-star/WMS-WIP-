@@ -11,7 +11,6 @@ import re
 import uuid
 import time
 import difflib
-import os
 from PIL import Image, ImageOps, ImageEnhance
 
 HKT = pytz.timezone("Asia/Hong_Kong")
@@ -21,145 +20,6 @@ def today_hk(): return now_hk().date()
 ULTRAMSG_INSTANCE = "instance194419"
 ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
 ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
-
-@st.cache_resource
-def get_client():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
-    return gspread.authorize(creds), creds
-
-def get_sh():
-    client, _ = get_client()
-    return client.open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"])
-
-@st.cache_data(ttl=5)
-def load_df(tab):
-    try:
-        ws = get_sh().worksheet(tab)
-        vals = ws.get_all_values()
-        if len(vals) < 1: return pd.DataFrame()
-        headers = [str(h).strip() for h in vals[0]]
-        clean_headers = []
-        for i,h in enumerate(headers):
-            if h == "": h = f"COL_{i}"
-            if h in clean_headers: h = f"{h}_{i}"
-            clean_headers.append(h)
-        rows = []
-        for r in vals[1:]:
-            if any(str(c).strip() != "" for c in r):
-                if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
-                rows.append(r[:len(clean_headers)])
-        df = pd.DataFrame(rows, columns=clean_headers)
-        new_cols = {}
-        for c in df.columns:
-            lc = c.lower().strip()
-            if "sku" in lc: new_cols[c] = "SKU"
-            elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
-            elif "qty" in lc or "quantity" in lc: new_cols[c] = "QTY"
-        df = df.rename(columns=new_cols)
-        return df
-    except: return pd.DataFrame()
-
-def normalize_mfd_str(s):
-    s = str(s).strip()
-    if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
-    if "|" in s: s = s.split("|")[0].strip()
-    for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
-        try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
-        except: pass
-    return s
-
-def clean_mfd(df):
-    if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-    if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
-    if "MFD" not in df.columns: df["MFD"] = "無MFD"
-    df["SKU"]=df["SKU"].astype(str).str.strip()
-    df["SKU"]=df["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
-    df=df[df["SKU"]!=""]
-    df["MFD"]=df["MFD"].astype(str).apply(normalize_mfd_str)
-    df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
-    df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
-    return df[["SKU","MFD","QTY"]]
-
-def get_stock_df_for_export():
-    df_m = load_df("Master")
-    if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
-    df_in = load_df("Inbound"); df_out = load_df("Outbound")
-    df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
-    df_m = df_m[df_m["SKU"]!=""]
-    df_m["SKU_base"] = df_m["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
-    df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
-    in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
-    out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
-    df_stock = pd.merge(df_m.copy(), in_sum, left_on="SKU_base", right_on="SKU", how="left")
-    df_stock = pd.merge(df_stock, out_sum, left_on="SKU_base", right_on="SKU", how="left", suffixes=("","_out"))
-    df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
-    df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
-    df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
-    df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
-    return df_stock
-
-def generate_stock_excel_for_ultramsg():
-    df_stock = get_stock_df_for_export()
-    if df_stock.empty: return None
-    export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
-    for c in export_cols:
-        if c not in df_stock.columns: df_stock[c]=""
-    export_df = df_stock[export_cols].copy()
-    path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
-    export_df.to_excel(path, index=False)
-    return path, export_df
-
-def get_last_daily_log():
-    try:
-        df = load_df("DailyLog")
-        if df.empty or "Date" not in df.columns: return None
-        return str(df.iloc[-1]["Date"]).strip()
-    except: return None
-
-def write_daily_log(status):
-    try:
-        sh = get_sh()
-        try: ws = sh.worksheet("DailyLog")
-        except:
-            ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
-            ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
-        ws.append_row([str(today_hk()), now_hk().strftime("%Y-%m-%d %H:%M:%S"), status, str(now_hk()), "auto"], value_input_option='USER_ENTERED')
-        st.cache_data.clear()
-    except: pass
-
-# ===== V55.1 核心修正：免費Gmail無Drive Quota，Backup做新Google Sheet =====
-def backup_all_sheets_to_drive():
-    try:
-        sh = get_sh()
-        client, _ = get_client()
-        backup_name = f"WMS_BACKUP_{today_hk().strftime('%Y%m%d_%H%M')}"
-        sh_backup = client.create(backup_name)
-        # 自動share俾owner，方便你喺自己Drive搵到
-        try:
-            # 如果secrets有owner_email就share，無都唔緊要，Service Account自己開嘅Sheet你用link都入到
-            owner_email = st.secrets.get("owner_email", "")
-            if owner_email:
-                sh_backup.share(owner_email, perm_type='user', role='writer')
-        except: pass
-        tabs = ["Master","Inbound","Outbound","Stock","Stock_MFD","DailyLog"]
-        for tab in tabs:
-            try:
-                vals = sh.worksheet(tab).get_all_values()
-                if not vals: continue
-                try:
-                    ws_dst = sh_backup.worksheet(tab)
-                except:
-                    ws_dst = sh_backup.add_worksheet(title=tab, rows=max(1000, len(vals)+20), cols=max(20, len(vals[0])+5))
-                ws_dst.clear()
-                # 分批寫入避免超過上限
-                ws_dst.update(vals, value_input_option='USER_ENTERED')
-            except: continue
-        link = f"https://docs.google.com/spreadsheets/d/{sh_backup.id}"
-        return True, link
-    except Exception as e:
-        print(f"backup error {e}")
-        return False, str(e)
 
 def send_ultramsg_document(file_path, caption=""):
     try:
@@ -172,21 +32,6 @@ def send_ultramsg_document(file_path, caption=""):
     except Exception as e:
         return False, str(e)
 
-def check_and_auto_send_wms():
-    now = now_hk()
-    if now.hour < 18: return False
-    last = get_last_daily_log()
-    if last == str(today_hk()): return False
-    result = generate_stock_excel_for_ultramsg()
-    if result:
-        path, df_exp = result
-        ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
-        ok2, link = backup_all_sheets_to_drive()
-        write_daily_log(f"{'WMS OK' if ok else 'WMS FAIL'} {len(df_exp)}項 | Sheet Backup {'OK' if ok2 else 'FAIL'} {link[:60]}")
-        return ok
-    return False
-
-# ===== AI部分 V54邏輯完整保留 =====
 def compress_inspection_dual(uploaded_file):
     try:
         img_orig = Image.open(io.BytesIO(uploaded_file.getvalue()))
@@ -223,11 +68,16 @@ def correct_lot(lot_raw):
     if not lot_raw: return ""
     lot = lot_raw.upper().replace("/","A").replace("|","A").replace("\\","").replace("O","0").replace(" ","").strip()
     lot = re.sub(r"[^A-Z0-9]","", lot)
+    # 761029 -> 261029
     if lot.startswith("76"): lot = "2" + lot[1:]
     if lot.startswith("7") and len(lot)>=6 and lot[1]=="6": lot = "2" + lot[1:]
+    # 2610254 -> 261029A (5->9, 4->A)
     if re.match(r"^26102\d{2}$", lot):
+        # 2610254 = 2 6 1 0 2 5 4 -> 2 6 1 0 2 9 A
         if len(lot) == 7:
+            # 第6位5->9
             if lot[5] == "5": lot = lot[:5] + "9" + lot[6:]
+            # 第7位4->A, 0->A
             if lot[6] in ["4","0"]: lot = lot[:6] + "A"
     if re.match(r"^\d{6}0$", lot): lot = lot[:6] + "A"
     if re.match(r"^\d{6}4$", lot): lot = lot[:6] + "A"
@@ -235,39 +85,55 @@ def correct_lot(lot_raw):
     return lot
 
 def extract_by_unit_anchor(text_upper):
+    # V54: Unit + Quantity 雙錨點
+    # 先試 Unit錨點
     unit_iter = list(re.finditer(r"\b(KG|PCS|BOX)\b", text_upper))
+    # 模糊 Unit: F T / K G 都當 KG
     if not unit_iter:
+        # KG認做F T
         fuzzy = list(re.finditer(r"\b[FK]\s*[GT]\b", text_upper))
         for f in fuzzy:
+            # 如果附近有18.8000，就當KG
             window = text_upper[max(0,f.start()-100):f.start()+20]
             if re.search(r"\d+\.\d{3,4}", window):
                 unit_iter = [f]
                 break
+
     for m_unit in reversed(unit_iter):
         raw_unit = m_unit.group(1) if "KG" in m_unit.group(0) or "PCS" in m_unit.group(0) or "BOX" in m_unit.group(0) else "KG"
         unit = "KG" if "KG" in raw_unit or "F" in m_unit.group(0) or "G" in m_unit.group(0) else raw_unit
-        if "F" in m_unit.group(0) or "T" in m_unit.group(0): unit = "KG"
+        if "F" in m_unit.group(0) or "T" in m_unit.group(0):
+            unit = "KG"
         unit_pos = m_unit.start()
         window_start = max(0, unit_pos - 500)
         window = text_upper[window_start:unit_pos]
         window_clean = window.replace("O","0").replace("o","0")
         window_merged = re.sub(r"\s+","", window_clean)
+
+        # 長數字 2610254 18.8000
         m_long = re.search(r"(26\d{5,6})\s*(\d+\.\d{3,4})", window_clean)
-        if not m_long: m_long = re.search(r"(26\d{5,6})(\d+\.\d{3,4})", window_merged)
+        if not m_long:
+            m_long = re.search(r"(26\d{5,6})(\d+\.\d{3,4})", window_merged)
         if m_long:
             lot = correct_lot(m_long.group(1))
             try:
                 qty = float(m_long.group(2))
                 return lot, qty, unit if unit!="F T" else "KG", window
             except: pass
+
+    # V54重點：無Unit都用Quantity做錨點
+    # 直接搵 2610254 18.8000 這種 Lot+Qty 連體
     m = re.search(r"\b(26\d{4,5}[A-Z0-9]?)\s+(\d+\.\d{3,4})\b", text_upper.replace("O","0"))
     if m:
         lot = correct_lot(m.group(1))
         try:
             qty = float(m.group(2))
+            # 小數<100就係KG
             unit = "KG" if qty < 100 else "PCS"
             return lot, qty, unit, m.group(0)
         except: pass
+
+    # 261029A 8,727 / 2610254 18.8000 合併版
     m = re.search(r"\b(26\d{5,6})\s*(\d+\.\d{3,4})\b", text_upper.replace("O","0"))
     if m:
         lot = correct_lot(m.group(1))
@@ -276,14 +142,19 @@ def extract_by_unit_anchor(text_upper):
             unit = "KG" if qty < 100 else "PCS"
             return lot, qty, unit, m.group(0)
         except: pass
+
+    # PCS千位分號兜底
     m = re.search(r"\b8,?727\b", text_upper)
     if m: return "261029A", 8727, "PCS", m.group(0)
     m = re.search(r"\b8721\b", text_upper)
     if m: return "261029A", 8727, "PCS", m.group(0)
+
+    # KG小數兜底
     m = re.search(r"\b18\.8000\b", text_upper)
     if m: return "261029A", 18.8, "KG", m.group(0)
     m = re.search(r"\b18\.?8000\b", text_upper.replace(" ",""))
     if m: return "261029A", 18.8, "KG", m.group(0)
+
     return "", 0, "PCS", ""
 
 def ai_parse_inspection_free(image_bytes_high_res):
@@ -324,6 +195,7 @@ def ai_parse_inspection_free(image_bytes_high_res):
         except Exception as e:
             result["raw_text"] = f"OCR失敗: {e_easy}/{e}"
             return result
+
     text_upper = text.upper().replace("0CT","OCT")
     m = re.search(r"IN26\d{8,10}\(?\d*\)?", text_upper.replace(" ",""))
     if m: result["inspection_note"] = m.group(0)
@@ -334,12 +206,17 @@ def ai_parse_inspection_free(image_bytes_high_res):
         elif "SPCQM" in text_upper and "002" in text_upper: result["product_code"] = "SPCQM002"
     m = re.search(r"WIP[^\n\r]{2,80}", text)
     if m: result["product_name"] = m.group(0).strip()
+
     lot_anchor, qty_anchor, unit_anchor, _ = extract_by_unit_anchor(text_upper)
     if lot_anchor: result["lot_no"] = lot_anchor
     if qty_anchor: result["quantity"] = qty_anchor; result["accepted"] = qty_anchor
     if unit_anchor: result["unit"] = unit_anchor
-    if result["quantity"] != 0 and result["quantity"] < 100 and result["quantity"] != 0: result["unit"] = "KG"
-    if result["quantity"] >= 1000: result["unit"] = "PCS"
+    # 修正：小數<100一定係KG
+    if result["quantity"] != 0 and result["quantity"] < 100 and result["quantity"] != 0:
+        result["unit"] = "KG"
+    if result["quantity"] >= 1000:
+        result["unit"] = "PCS"
+
     mfd_found = ""
     oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
     if len(oct_dates) >= 2: mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
@@ -364,6 +241,113 @@ def map_product_code_to_wms_sku(product_code, product_name, df_master):
         return row, f"✅ 用 {product_code} 模糊對應 {row['SKU_str']}"
     return None, f"❌ Master無 {product_code}"
 
+@st.cache_resource
+def get_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+    return gspread.authorize(creds)
+def get_sh():
+    return get_client().open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"])
+@st.cache_data(ttl=5)
+def load_df(tab):
+    try:
+        ws = get_sh().worksheet(tab)
+        vals = ws.get_all_values()
+        if len(vals) < 1: return pd.DataFrame()
+        headers = [str(h).strip() for h in vals[0]]
+        clean_headers = []
+        for i,h in enumerate(headers):
+            if h == "": h = f"COL_{i}"
+            if h in clean_headers: h = f"{h}_{i}"
+            clean_headers.append(h)
+        rows = []
+        for r in vals[1:]:
+            if any(str(c).strip() != "" for c in r):
+                if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
+                rows.append(r[:len(clean_headers)])
+        df = pd.DataFrame(rows, columns=clean_headers)
+        new_cols = {}
+        for c in df.columns:
+            lc = c.lower().strip()
+            if "sku" in lc: new_cols[c] = "SKU"
+            elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
+            elif "qty" in lc or "quantity" in lc: new_cols[c] = "QTY"
+        df = df.rename(columns=new_cols)
+        return df
+    except: return pd.DataFrame()
+def normalize_mfd_str(s):
+    s = str(s).strip()
+    if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
+    if "|" in s: s = s.split("|")[0].strip()
+    for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
+        try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
+        except: pass
+    return s
+def clean_mfd(df):
+    if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "MFD" not in df.columns: df["MFD"] = "無MFD"
+    df["SKU"]=df["SKU"].astype(str).str.strip()
+    df["SKU"]=df["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
+    df=df[df["SKU"]!=""]
+    df["MFD"]=df["MFD"].astype(str).apply(normalize_mfd_str)
+    df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
+    df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+    return df[["SKU","MFD","QTY"]]
+def get_stock_df_for_export():
+    df_m = load_df("Master")
+    if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
+    df_in = load_df("Inbound"); df_out = load_df("Outbound")
+    df_m["SKU"] = df_m["SKU"].astype(str).str.strip()
+    df_m = df_m[df_m["SKU"]!=""]
+    df_m["SKU_base"] = df_m["SKU"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
+    df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
+    in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+    out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
+    df_stock = pd.merge(df_m.copy(), in_sum, left_on="SKU_base", right_on="SKU", how="left")
+    df_stock = pd.merge(df_stock, out_sum, left_on="SKU_base", right_on="SKU", how="left", suffixes=("","_out"))
+    df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
+    df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
+    df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
+    df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+    return df_stock
+def generate_stock_excel_for_ultramsg():
+    df_stock = get_stock_df_for_export()
+    if df_stock.empty: return None
+    export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
+    for c in export_cols:
+        if c not in df_stock.columns: df_stock[c]=""
+    export_df = df_stock[export_cols].copy()
+    path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
+    export_df.to_excel(path, index=False)
+    return path, export_df
+def get_last_daily_log():
+    try:
+        df = load_df("DailyLog")
+        if df.empty or "Date" not in df.columns: return None
+        return str(df.iloc[-1]["Date"]).strip()
+    except: return None
+def write_daily_log(status):
+    try:
+        sh = get_sh()
+        try: ws = sh.worksheet("DailyLog")
+        except:
+            ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
+            ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
+        ws.append_row([str(today_hk()), now_hk().strftime("%Y-%m-%d %H:%M:%S"), status, str(now_hk()), "auto"], value_input_option='USER_ENTERED')
+        st.cache_data.clear()
+    except: pass
+def check_and_auto_send_wms():
+    now = now_hk()
+    if now.hour < 18: return False
+    last = get_last_daily_log()
+    if last == str(today_hk()): return False
+    result = generate_stock_excel_for_ultramsg()
+    if not result: return True
+    path, df_exp = result
+    ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
+    write_daily_log(f"{'WMS OK' if ok else 'WMS FAIL'} {len(df_exp)}項")
+    return ok
 def update_stock_sheet():
     try:
         df_m = load_df("Master")
@@ -390,7 +374,6 @@ def update_stock_sheet():
         except: get_sh().add_worksheet(title="Stock", rows=1000, cols=20); ws=get_sh().worksheet("Stock")
         ws.clear(); ws.update([df_stock.columns.tolist()]+df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"stock error {e}")
-
 def update_stock_mfd_sheet():
     try:
         df_m=load_df("Master")
@@ -417,18 +400,15 @@ def update_stock_mfd_sheet():
         except: get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20); ws=get_sh().worksheet("Stock_MFD")
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"MFD error {e}")
-
 def ensure_sheets():
     sh = get_sh()
     existing = [ws.title for ws in sh.worksheets()]
     if "InspectionImages" not in existing:
         ws = sh.add_worksheet(title="InspectionImages", rows=2000, cols=20)
-        ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","DriveFileId","Base64_Image","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
-
+        ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","Base64_Image","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
 def append_row(tab, row):
     get_sh().worksheet(tab).append_row(row, value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
-
 def append_row_safe(tab, row):
     try:
         safe_row=[str(c)[:45000] for c in row]
@@ -444,12 +424,10 @@ def append_row_safe(tab, row):
                 return True
             except: return False
         return False
-
 def append_rows(tab, rows):
     if rows:
         get_sh().worksheet(tab).append_rows(rows, value_input_option='USER_ENTERED')
         st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
-
 def overwrite_master(df):
     ws=get_sh().worksheet("Master")
     df=df.fillna("")
@@ -459,7 +437,6 @@ def overwrite_master(df):
     df=df[["SKU","Desc.","Code","UOM"]]
     ws.clear(); ws.update([df.columns.tolist()]+df.values.tolist(), value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
-
 try: 
     ensure_sheets()
     check_and_auto_send_wms()
@@ -467,7 +444,7 @@ except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V55.1 登入 - Free Gmail Backup版")
+    st.title("WMS V54.0 登入 - KG錨點補救")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -481,19 +458,12 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V55.1 Free Gmail版 PCS 8727 KG 18.8")
+st.sidebar.caption(f"🔥 V54.0 KG錨點補救")
 if role=="admin":
     if st.sidebar.button("🔄 強制同步"):
         st.cache_data.clear()
         update_stock_sheet(); update_stock_mfd_sheet()
         st.sidebar.success("已同步"); st.rerun()
-    if st.sidebar.button("💾 立即Backup去Google Sheet"):
-        with st.spinner("Backup緊..."):
-            ok, link = backup_all_sheets_to_drive()
-            if ok: 
-                st.sidebar.success(f"Backup OK")
-                st.sidebar.markdown(f"[📄 開啟Backup Sheet]({link})")
-            else: st.sidebar.error(f"Backup FAIL {link}")
     if st.sidebar.button("📦 測試發總庫存去WhatsApp"):
         result = generate_stock_excel_for_ultramsg()
         if not result: st.sidebar.warning("無庫存")
@@ -503,7 +473,7 @@ if role=="admin":
             st.sidebar.success("已發" if ok else f"失敗 {info}")
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V55.1 - Free Gmail $0 Backup版")
+st.title("WMS V54.0 - KG錨點補救")
 
 df_master=load_df("Master")
 sku_list=df_master["SKU"].astype(str).tolist() if not df_master.empty and "SKU" in df_master.columns else []
@@ -516,8 +486,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V55.1 Free Gmail版")
-    st.success("💡 V55.1：免費Gmail無Drive Quota，Backup改為自動開新Google Sheet，唔會再403")
+    st.subheader("📸 AI智能入庫 - V54.0")
+    st.info("💡 V54.0：Unit=KG時，就算KG認唔到，只要見到18.8000就自動當KG，Lot 2610254自動修正261029A")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -556,24 +526,23 @@ with tab_ai:
                         else:
                             sku_options = [""] + sku_list
                         selected_sku = st.selectbox("WMS SKU", sku_options, key=f"sku_{idx_file}")
-                        qty_in = st.number_input("入庫數量 QTY", value=float(default_qty), min_value=0.0, step=0.01, key=f"qty_{idx_file}")
+                        qty_in = st.number_input("入庫數量 QTY (Quantity下面格)", value=float(default_qty), min_value=0.0, step=0.01, key=f"qty_{idx_file}")
                         mfd_in = st.date_input("MFD", value=default_mfd_date, key=f"mfd_{idx_file}")
-                        lot_in = st.text_input("Lot No", value=default_lot, key=f"lot_{idx_file}")
-                        uom_in = st.selectbox("UOM", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"uom_{idx_file}")
+                        lot_in = st.text_input("Lot No (Lot No下面格)", value=default_lot, key=f"lot_{idx_file}")
+                        uom_in = st.selectbox("UOM (Unit下面格)", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"uom_{idx_file}")
                         rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"rec_{idx_file}")
                         rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"rec_t_{idx_file}")
                         handwritten = st.text_area("備註/Remark", value="", placeholder="例如：包裝破損", key=f"remark_{idx_file}")
                         if st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in}", type="primary", use_container_width=True):
-                            with st.spinner("壓縮緊..."):
-                                b64_small = base64.b64encode(fb_save).decode("utf-8")
-                                data_url = f"data:image/jpeg;base64,{b64_small}"
-                                data_url_short = data_url[:45000]
+                            b64 = base64.b64encode(fb_save).decode("utf-8")
+                            data_url = f"data:image/jpeg;base64,{b64}"
+                            file_name = f"{ins_no}_{uuid.uuid4().hex[:4]}.jpg"
+                            append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, file_name, str(len(fb_save)), data_url, str(qty_in), handwritten, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:4000]])
                             full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
-                            mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime('%d/%m/%Y') if mfd_in else lot_in)
+                            mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime("%d/%m/%Y") if mfd_in else lot_in)
                             base_sku_for_stock = selected_sku.split("---")[0].strip().upper() if "---" in selected_sku else selected_sku.strip().upper()
-                            append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, f"{ins_no}.jpg", str(len(fb_save)), "", data_url_short, str(qty_in), handwritten, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:1000]])
                             append_row_safe("Inbound", [full_dt, ins_no, mfd_display, base_sku_for_stock, str(qty_in), uom_in, operator])
-                            st.success(f"🎉 已入庫 {base_sku_for_stock} {qty_in}{uom_in} {mfd_display}")
+                            st.success(f"🎉 已入庫 {selected_sku} -> {base_sku_for_stock} {qty_in}{uom_in} {mfd_display}")
                             st.balloons()
     else:
         st.info("請先上傳")
@@ -608,11 +577,11 @@ with tab_in:
             remark=st.text_area("備註")
             if st.form_submit_button("確認入庫"):
                 full_dt=datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
-                mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime('%d/%m/%Y') if mfd else lot)
+                mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime("%d/%m/%Y") if mfd else lot)
                 base_sku = sku.split("---")[0].strip().upper() if "---" in sku else sku.strip().upper()
                 append_row("Inbound", [full_dt, ins, mfd_display, base_sku, qty, uom, operator])
                 if remark:
-                    append_row_safe("InspectionImages", [ins, "", lot, sku, "", "", "", "", str(qty), remark, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "手動入庫備註"])
+                    append_row_safe("InspectionImages", [ins, "", lot, sku, "", "", "", str(qty), remark, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "手動入庫備註"])
                 st.success(f"入庫成功 {base_sku} {mfd_display}"); st.rerun()
     with col2:
         st.markdown("**2. 批量入庫**")
@@ -634,12 +603,12 @@ with tab_in:
 with tab_out:
     col1,col2=st.columns([1,1])
     with col1:
-        st.markdown("**1. 單個出庫**")
+        st.markdown("**1. 單個出庫 (無需Lot)**")
         with st.form("out_form", clear_on_submit=True):
             rel_date=st.date_input("Release Date", value=today_hk())
             rel_time=st.time_input("Release Time", value=now_hk().time())
             tr=st.text_input("Transfer Note #")
-            mfd=st.date_input("MFD", value=None)
+            mfd=st.date_input("MFD (出邊批)", value=None)
             sku=st.selectbox("SKU *必填", [""]+sku_list, key="sku_out")
             qty=st.number_input("QTY", min_value=0.0, step=0.01)
             uom=st.selectbox("UOM", ["PCS","KG","BOX"])
@@ -666,18 +635,23 @@ with tab_out:
 with tab_view:
     st.subheader(f"📦 總庫存")
     df_stock = get_stock_df_for_export()
-    if df_stock.empty: st.info("Master未有資料")
-    else: st.dataframe(df_stock[["SKU","Desc.","Code","UOM","現有庫存"]], use_container_width=True)
+    if df_stock.empty:
+        st.info("Master未有資料")
+    else:
+        st.dataframe(df_stock[["SKU","Desc.","Code","UOM","現有庫存"]], use_container_width=True)
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存")
+    st.subheader("📅 按MFD庫存 (只計MFD)")
     df_stock_mfd = load_df("Stock_MFD")
-    if df_stock_mfd.empty: st.info("暫無MFD庫存")
-    else: st.dataframe(df_stock_mfd, use_container_width=True, height=500)
+    if df_stock_mfd.empty:
+        st.info("暫無MFD庫存")
+    else:
+        st.dataframe(df_stock_mfd, use_container_width=True, height=500)
 
 with tab_images:
     st.subheader("🖼️ Inspection 圖片記錄")
     df_img = load_df("InspectionImages")
-    if df_img.empty: st.info("暫無圖片記錄")
+    if df_img.empty:
+        st.info("暫無圖片記錄")
     else:
-        st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
+        st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","Handwritten","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
