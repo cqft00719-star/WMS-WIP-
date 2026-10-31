@@ -9,3 +9,4 @@ Pillow
 pytesseract
 easyocr
 opencv-python-headless
+google-api-python-client
