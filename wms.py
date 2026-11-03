@@ -199,7 +199,7 @@ def map_product_code_to_wms_sku(product_code, product_name, df_master):
     if not product_code: return None, "無Product Code"
     product_code = str(product_code).strip().upper()
     df_master["SKU_str"] = df_master["SKU"].astype(str).str.strip()
-    df_master["SKU_base"] = df_master["SKU_str"].apply(lambda x: x.split("---")[0].strip().upper() if "---" in x else x.strip().upper())
+    df_master["SKU_base"] = df_master["SKU_str"].apply(lambda x: normalize_sku(x))
     exact = df_master[df_master["SKU_base"] == product_code]
     if not exact.empty: return exact.iloc[0].to_dict(), f"✅ 用 {product_code} 對應 {exact.iloc[0]['SKU_str']}"
     contains = df_master[df_master["SKU_str"].str.upper().str.contains(product_code, na=False)]
@@ -210,13 +210,14 @@ def map_product_code_to_wms_sku(product_code, product_name, df_master):
         return row, f"✅ 用 {product_code} 模糊對應 {row['SKU_str']}"
     return None, f"❌ Master無 {product_code}"
 
-# ===== V54.4 核心修復 =====
+# ===== V54.5 核心修復：保留 -2 變種 =====
 def normalize_sku(s):
     if not s: return ""
     s = str(s).strip().upper()
     if "---" in s: s = s.split("---")[0]
     s = s.split(" ")[0].split("\t")[0].strip()
-    m = re.search(r'(SPBMC\d+|SPCQP\d+|SPCQM\d+|SPBMP\d+|SPBMC0\d+)', s)
+    # 支援 SPBMC003-2 / SPBMC002-2 / SPBMC003-2 等
+    m = re.search(r'(SPBMC\d+(?:-\d+)?|SPCQP\d+(?:-\d+)?|SPCQM\d+(?:-\d+)?|SPBMP\d+(?:-\d+)?|SPBMM\d+(?:-\d+)?|SPBMC0\d+(?:-\d+)?)', s)
     if m: return m.group(1)
     return s
 
@@ -438,7 +439,6 @@ def backfill_inbound_outbound_chinese():
                 sku_col_idx = headers.index("SKU")
             except:
                 sku_col_idx = 3
-            updates = []
             for r_idx in range(2, len(vals)+1):
                 row = vals[r_idx-1]
                 if len(row) <= sku_col_idx: continue
@@ -446,7 +446,6 @@ def backfill_inbound_outbound_chinese():
                 if not raw_sku: continue
                 base = normalize_sku(raw_sku)
                 if not base: continue
-                # 如果已經有 --- 就跳過
                 if "---" in raw_sku: continue
                 if base in master_map:
                     desc = master_map[base]["Desc"]
@@ -520,7 +519,7 @@ except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V54.4 登入 - 中文名自動補回")
+    st.title("WMS V54.5 登入 - 支援 -2 變種")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -534,20 +533,20 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V54.4 中文名自動補回 | Stock安全")
+st.sidebar.caption(f"🔥 V54.5 支援 SPBMC003-2 / SPBMC002-2 | Stock安全")
 
 if role=="admin":
-    if st.sidebar.button("🔄 強制同步", key="sync54_4"):
+    if st.sidebar.button("🔄 強制同步", key="sync54_5"):
         st.cache_data.clear()
         update_stock_sheet(); update_stock_mfd_sheet()
-        st.sidebar.success("Stock & Stock_MFD已同步，數字不變"); st.rerun()
-    if st.sidebar.button("🔧 一鍵補回 Inbound/Outbound 中文名", key="backfill54_4"):
-        with st.spinner("逐行補回中文中，11/2開始嗰批會變返有WIP中文..."):
+        st.sidebar.success("Stock & Stock_MFD已同步"); st.rerun()
+    if st.sidebar.button("🔧 一鍵補回 Inbound/Outbound 中文名", key="backfill54_5"):
+        with st.spinner("補回中文中，支援 -2 變種..."):
             cnt, msg = backfill_inbound_outbound_chinese()
         st.sidebar.success(msg)
         st.balloons()
         st.rerun()
-    if st.sidebar.button("📦 測試發總庫存去WhatsApp", key="testwa54_4"):
+    if st.sidebar.button("📦 測試發總庫存去WhatsApp", key="testwa54_5"):
         result = generate_stock_excel_for_ultramsg()
         if not result: st.sidebar.warning("無庫存")
         else:
@@ -557,7 +556,7 @@ if role=="admin":
 
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V54.4 - 中文名自動補回 + Stock安全")
+st.title("WMS V54.5 - 支援 -2 變種 + 中文自動補回")
 
 df_master=load_df("Master")
 master_map = get_master_map(df_master)
@@ -573,8 +572,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V54.4")
-    st.success("💡 V54.4：入庫自動寫返中文名到Sheet，Stock用base Code計，安全")
+    st.subheader("📸 AI智能入庫 - V54.5")
+    st.success("💡 V54.5：已支援 SPBMC003-2 / SPBMC002-2 等 -2 變種，Stock分開計")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -646,7 +645,7 @@ if role=="admin":
 with tab_in:
     col1,col2=st.columns([1,1])
     with col1:
-        st.markdown("**1. 單個入庫 (自動帶中文)**")
+        st.markdown("**1. 單個入庫 (支援 -2)**")
         with st.form("in_form", clear_on_submit=True):
             rec_date=st.date_input("Receiving Date", value=today_hk())
             rec_time=st.time_input("Receiving Time", value=now_hk().time())
@@ -680,9 +679,9 @@ with tab_in:
                     base_sku = normalize_sku(sku_raw)
                     display_sku = get_display_sku(base_sku, master_map)
                     rows.append([str(r.get("Receiving Date","") or today_hk()), str(r.get("Inspection Note #","")), mfd_display, display_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
-                append_rows("Inbound", rows); st.success(f"已批量入庫 {len(rows)}，已帶中文"); st.rerun()
+                append_rows("Inbound", rows); st.success(f"已批量入庫 {len(rows)}，支援-2"); st.rerun()
     st.divider()
-    st.markdown("**📜 最近入庫紀錄 (已自動補中文名)**")
+    st.markdown("**📜 最近入庫紀錄**")
     df_in_hist = load_df("Inbound")
     if not df_in_hist.empty:
         df_in_hist = enrich_with_master(df_in_hist, master_map)
@@ -691,7 +690,7 @@ with tab_in:
 with tab_out:
     col1,col2=st.columns([1,1])
     with col1:
-        st.markdown("**1. 單個出庫 (自動帶中文)**")
+        st.markdown("**1. 單個出庫 (支援 -2)**")
         with st.form("out_form", clear_on_submit=True):
             rel_date=st.date_input("Release Date", value=today_hk())
             rel_time=st.time_input("Release Time", value=now_hk().time())
@@ -720,22 +719,22 @@ with tab_out:
                     base_sku = normalize_sku(sku_raw)
                     display_sku = get_display_sku(base_sku, master_map)
                     rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), display_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
-                append_rows("Outbound", rows); st.success(f"已批量出庫 {len(rows)}，已帶中文"); st.rerun()
+                append_rows("Outbound", rows); st.success(f"已批量出庫 {len(rows)}"); st.rerun()
     st.divider()
-    st.markdown("**📜 最近出庫紀錄 (自動補中文)**")
+    st.markdown("**📜 最近出庫紀錄**")
     df_out_hist = load_df("Outbound")
     if not df_out_hist.empty:
         df_out_hist = enrich_with_master(df_out_hist, master_map)
         st.dataframe(df_out_hist[["SKU_base","顯示","中文名","MFD","QTY","UOM"]].tail(100).sort_index(ascending=False), use_container_width=True, height=400)
 
 with tab_view:
-    st.subheader(f"📦 總庫存 - V54.4 Stock安全")
+    st.subheader(f"📦 總庫存 - V54.5 支援-2")
     df_stock = get_stock_df_for_export()
     if df_stock.empty: st.info("Master未有資料")
     else: 
         show_df = df_stock[["SKU","Desc.","Code","UOM","現有庫存"]].copy()
         st.dataframe(show_df, use_container_width=True)
-        st.caption(f"共 {len(show_df)} 項，已自動修復空SKU，Stock計算用base Code，唔受中文影響")
+        st.caption(f"共 {len(show_df)} 項，已支援 SPBMC003-2 / SPBMC002-2 分開計庫存")
 
 with tab_mfd:
     st.subheader("📅 按MFD庫存")
@@ -746,5 +745,17 @@ with tab_mfd:
 with tab_images:
     st.subheader("🖼️ Inspection 圖片記錄")
     df_img = load_df("InspectionImages")
-    if df_img.empty: st.info("暫無圖片記錄")
-    else: st.dataframe(df_img[["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","Handwritten","CreatedAt_HKT"]].sort_values(by="CreatedAt_HKT", ascending=False).head(100), use_container_width=True)
+    if df_img.empty:
+        st.info("暫無圖片記錄")
+    else:
+        # V54.5 防爆：自動適應欄位
+        wanted = ["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","Handwritten","CreatedAt_HKT"]
+        cols_show = [c for c in wanted if c in df_img.columns]
+        if not cols_show:
+            cols_show = df_img.columns.tolist()[:8]
+        try:
+            sort_key = "CreatedAt_HKT" if "CreatedAt_HKT" in df_img.columns else cols_show[0]
+            st.dataframe(df_img[cols_show].sort_values(by=sort_key, ascending=False).head(100), use_container_width=True)
+        except Exception as e:
+            st.dataframe(df_img[cols_show].head(100), use_container_width=True)
+            st.caption(f"顯示備用模式: {e}")
