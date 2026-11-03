@@ -210,15 +210,24 @@ def map_product_code_to_wms_sku(product_code, product_name, df_master):
         return row, f"✅ 用 {product_code} 模糊對應 {row['SKU_str']}"
     return None, f"❌ Master無 {product_code}"
 
-# ===== V54.3 新增：統一SKU正規化 =====
+# ===== V54.4 核心修復 =====
 def normalize_sku(s):
     if not s: return ""
     s = str(s).strip().upper()
     if "---" in s: s = s.split("---")[0]
     s = s.split(" ")[0].split("\t")[0].strip()
-    m = re.search(r'(SPBMC\d+|SPCQP\d+|SPCQM\d+|SPBMC0\d+)', s)
+    m = re.search(r'(SPBMC\d+|SPCQP\d+|SPCQM\d+|SPBMP\d+|SPBMC0\d+)', s)
     if m: return m.group(1)
     return s
+
+def get_effective_sku(row):
+    sku = str(row.get("SKU","")).strip()
+    if sku and sku.lower() not in ["none","nan","", "無"]:
+        return normalize_sku(sku)
+    code = str(row.get("Code","")).strip()
+    if code and code.lower() not in ["none","nan",""]:
+        return normalize_sku(code)
+    return ""
 
 def get_master_map(df_master):
     if df_master.empty: return {}
@@ -231,6 +240,14 @@ def get_master_map(df_master):
         if base not in mp:
             mp[base] = {"Desc": str(r.get("Desc.","")), "Code": str(r.get("Code","")), "UOM": str(r.get("UOM",""))}
     return mp
+
+def get_display_sku(base_code, master_map):
+    base = normalize_sku(base_code)
+    if not base: return ""
+    desc = master_map.get(base, {}).get("Desc","").strip()
+    if desc:
+        return f"{base}---WIP-{desc}"
+    return base
 
 @st.cache_resource
 def get_client():
@@ -284,15 +301,6 @@ def clean_mfd(df):
     df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
     df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
     return df[["SKU","MFD","QTY"]]
-
-def get_effective_sku(row):
-    sku = str(row.get("SKU","")).strip()
-    if sku and sku.lower() not in ["none","nan","", "無"]:
-        return normalize_sku(sku)
-    code = str(row.get("Code","")).strip()
-    if code and code.lower() not in ["none","nan",""]:
-        return normalize_sku(code)
-    return ""
 
 def get_stock_df_for_export():
     df_m = load_df("Master")
@@ -410,6 +418,50 @@ def update_stock_mfd_sheet():
         ws.clear(); ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED')
     except Exception as e: print(f"MFD error {e}")
 
+def backfill_inbound_outbound_chinese():
+    try:
+        sh = get_sh()
+        df_master = load_df("Master")
+        master_map = get_master_map(df_master)
+        if not master_map:
+            return 0, "Master無資料"
+        total_fixed = 0
+        for tab_name in ["Inbound","Outbound"]:
+            try:
+                ws = sh.worksheet(tab_name)
+            except:
+                continue
+            vals = ws.get_all_values()
+            if len(vals) < 2: continue
+            headers = [h.strip() for h in vals[0]]
+            try:
+                sku_col_idx = headers.index("SKU")
+            except:
+                sku_col_idx = 3
+            updates = []
+            for r_idx in range(2, len(vals)+1):
+                row = vals[r_idx-1]
+                if len(row) <= sku_col_idx: continue
+                raw_sku = row[sku_col_idx].strip()
+                if not raw_sku: continue
+                base = normalize_sku(raw_sku)
+                if not base: continue
+                # 如果已經有 --- 就跳過
+                if "---" in raw_sku: continue
+                if base in master_map:
+                    desc = master_map[base]["Desc"]
+                    if desc:
+                        new_val = f"{base}---WIP-{desc}"
+                        ws.update_cell(r_idx, sku_col_idx+1, new_val)
+                        total_fixed += 1
+                        time.sleep(0.35)
+            st.cache_data.clear()
+        update_stock_sheet()
+        update_stock_mfd_sheet()
+        return total_fixed, f"已補回 {total_fixed} 行"
+    except Exception as e:
+        return 0, f"失敗: {e}"
+
 def ensure_sheets():
     sh = get_sh()
     existing = [ws.title for ws in sh.worksheets()]
@@ -452,7 +504,6 @@ def overwrite_master(df):
     ws.clear(); ws.update([df.columns.tolist()]+df.values.tolist(), value_input_option='USER_ENTERED')
     st.cache_data.clear(); update_stock_sheet(); update_stock_mfd_sheet()
 
-# 顯示用：將In/Out歷史自動補中文名
 def enrich_with_master(df, master_map):
     if df.empty: return df
     df = df.copy()
@@ -469,7 +520,7 @@ except Exception as e: print(f"init error {e}")
 
 if "user" not in st.session_state: st.session_state.user=None
 if not st.session_state.user:
-    st.title("WMS V54.3 登入 - 中文名修復")
+    st.title("WMS V54.4 登入 - 中文名自動補回")
     df_users=load_df("Users")
     if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
     df_users["username"]=df_users["username"].astype(str).str.strip()
@@ -483,25 +534,30 @@ if not st.session_state.user:
 
 user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
 st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
-st.sidebar.caption(f"🔥 V54.3 中文名修復 + 顯示補回")
+st.sidebar.caption(f"🔥 V54.4 中文名自動補回 | Stock安全")
+
 if role=="admin":
-    if st.sidebar.button("🔄 強制同步"):
+    if st.sidebar.button("🔄 強制同步", key="sync54_4"):
         st.cache_data.clear()
         update_stock_sheet(); update_stock_mfd_sheet()
-        st.sidebar.success("已同步"); st.rerun()
-    if st.sidebar.button("🔧 一鍵補回Outbound中文顯示"):
-        st.cache_data.clear()
-        st.sidebar.success("已清Cache，Outbound/Inbound紀錄會自動顯示中文名 (原Sheet保持Base Code計庫存，安全)"); st.rerun()
-    if st.sidebar.button("📦 測試發總庫存去WhatsApp"):
+        st.sidebar.success("Stock & Stock_MFD已同步，數字不變"); st.rerun()
+    if st.sidebar.button("🔧 一鍵補回 Inbound/Outbound 中文名", key="backfill54_4"):
+        with st.spinner("逐行補回中文中，11/2開始嗰批會變返有WIP中文..."):
+            cnt, msg = backfill_inbound_outbound_chinese()
+        st.sidebar.success(msg)
+        st.balloons()
+        st.rerun()
+    if st.sidebar.button("📦 測試發總庫存去WhatsApp", key="testwa54_4"):
         result = generate_stock_excel_for_ultramsg()
         if not result: st.sidebar.warning("無庫存")
         else:
             path, df_exp = result
             ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
             st.sidebar.success("已發" if ok else f"失敗 {info}")
+
 if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
 
-st.title("WMS V54.3 - Outbound中文名修復版")
+st.title("WMS V54.4 - 中文名自動補回 + Stock安全")
 
 df_master=load_df("Master")
 master_map = get_master_map(df_master)
@@ -517,8 +573,8 @@ else:
     tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
 
 with tab_ai:
-    st.subheader("📸 AI智能入庫 - V54.3")
-    st.success("💡 V54.3：修復SKU中文名顯示，SPBMC023自動補回櫻花蝦等中文名")
+    st.subheader("📸 AI智能入庫 - V54.4")
+    st.success("💡 V54.4：入庫自動寫返中文名到Sheet，Stock用base Code計，安全")
     ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
     if ai_files:
         for idx_file, af in enumerate(ai_files):
@@ -538,7 +594,6 @@ with tab_ai:
                         sku_info, msg = map_product_code_to_wms_sku(parsed["product_code"], parsed["product_name"], df_master)
                         if "✅" in msg: st.success(msg)
                         else: st.error(msg)
-                        if sku_info: st.success(f"WMS SKU: {sku_info.get('SKU','')} | {master_map.get(normalize_sku(sku_info.get('SKU','')),{}).get('Desc','')}")
                     else:
                         sku_info = None
                         st.warning("未認到Product Code")
@@ -572,11 +627,10 @@ with tab_ai:
                             full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
                             mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime('%d/%m/%Y') if mfd_in else lot_in)
                             base_sku_for_stock = normalize_sku(selected_sku)
-                            append_row_safe("Inbound", [full_dt, ins_no, mfd_display, base_sku_for_stock, str(qty_in), uom_in, operator])
-                            st.success(f"🎉 已入庫 {selected_sku} -> {base_sku_for_stock} {qty_in}{uom_in} {mfd_display} | {master_map.get(base_sku_for_stock,{}).get('Desc','')}")
+                            display_sku = get_display_sku(base_sku_for_stock, master_map)
+                            append_row_safe("Inbound", [full_dt, ins_no, mfd_display, display_sku, str(qty_in), uom_in, operator])
+                            st.success(f"🎉 已入庫 {display_sku} {qty_in}{uom_in}")
                             st.balloons()
-    else:
-        st.info("請先上傳")
 
 if role=="admin":
     with tab_master:
@@ -592,7 +646,7 @@ if role=="admin":
 with tab_in:
     col1,col2=st.columns([1,1])
     with col1:
-        st.markdown("**1. 單個入庫**")
+        st.markdown("**1. 單個入庫 (自動帶中文)**")
         with st.form("in_form", clear_on_submit=True):
             rec_date=st.date_input("Receiving Date", value=today_hk())
             rec_time=st.time_input("Receiving Time", value=now_hk().time())
@@ -607,10 +661,9 @@ with tab_in:
                 full_dt=datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
                 mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime('%d/%m/%Y') if mfd else lot)
                 base_sku = normalize_sku(sku)
-                append_row("Inbound", [full_dt, ins, mfd_display, base_sku, qty, uom, operator])
-                if remark:
-                    append_row_safe("InspectionImages", [ins, "", lot, sku, "", "", "", str(qty), remark, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "手動入庫備註"])
-                st.success(f"入庫成功 {base_sku} {mfd_display} | {master_map.get(base_sku,{}).get('Desc','')}"); st.rerun()
+                display_sku = get_display_sku(base_sku, master_map)
+                append_row("Inbound", [full_dt, ins, mfd_display, display_sku, qty, uom, operator])
+                st.success(f"入庫成功 {display_sku} {mfd_display}"); st.rerun()
     with col2:
         st.markdown("**2. 批量入庫**")
         f_in=st.file_uploader("上傳入庫Excel/CSV", type=["xlsx","csv"])
@@ -625,21 +678,20 @@ with tab_in:
                     mfd_display = f"{mfd_val} | {lot_val}" if mfd_val and lot_val and "|" not in mfd_val else mfd_val
                     sku_raw = str(r.get("SKU",""))
                     base_sku = normalize_sku(sku_raw)
-                    rows.append([str(r.get("Receiving Date","") or today_hk()), str(r.get("Inspection Note #","")), mfd_display, base_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
-                append_rows("Inbound", rows); st.success(f"已批量入庫 {len(rows)}"); st.rerun()
+                    display_sku = get_display_sku(base_sku, master_map)
+                    rows.append([str(r.get("Receiving Date","") or today_hk()), str(r.get("Inspection Note #","")), mfd_display, display_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
+                append_rows("Inbound", rows); st.success(f"已批量入庫 {len(rows)}，已帶中文"); st.rerun()
     st.divider()
     st.markdown("**📜 最近入庫紀錄 (已自動補中文名)**")
     df_in_hist = load_df("Inbound")
     if not df_in_hist.empty:
         df_in_hist = enrich_with_master(df_in_hist, master_map)
         st.dataframe(df_in_hist[["SKU_base","顯示","中文名","MFD","QTY","UOM"]].tail(100).sort_index(ascending=False), use_container_width=True, height=300)
-    else:
-        st.info("暫無入庫")
 
 with tab_out:
     col1,col2=st.columns([1,1])
     with col1:
-        st.markdown("**1. 單個出庫**")
+        st.markdown("**1. 單個出庫 (自動帶中文)**")
         with st.form("out_form", clear_on_submit=True):
             rel_date=st.date_input("Release Date", value=today_hk())
             rel_time=st.time_input("Release Time", value=now_hk().time())
@@ -652,8 +704,9 @@ with tab_out:
                 full_dt=datetime.datetime.combine(rel_date, rel_time).strftime("%Y-%m-%d %H:%M:%S")
                 mfd_str=mfd.strftime("%d/%m/%Y") if mfd else ""
                 base_sku = normalize_sku(sku)
-                append_row("Outbound", [full_dt, tr, mfd_str, base_sku, qty, uom, operator])
-                st.success(f"出庫成功 {base_sku} {mfd_str} | {master_map.get(base_sku,{}).get('Desc','')}"); st.rerun()
+                display_sku = get_display_sku(base_sku, master_map)
+                append_row("Outbound", [full_dt, tr, mfd_str, display_sku, qty, uom, operator])
+                st.success(f"出庫成功 {display_sku} {mfd_str}"); st.rerun()
     with col2:
         st.markdown("**2. 批量出庫**")
         f_out=st.file_uploader("上傳出庫Excel/CSV", type=["xlsx","csv"], key="out_bulk")
@@ -665,31 +718,27 @@ with tab_out:
                 for _, r in df_out.iterrows():
                     sku_raw = str(r.get("SKU",""))
                     base_sku = normalize_sku(sku_raw)
-                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), base_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
-                append_rows("Outbound", rows); st.success(f"已批量出庫 {len(rows)}"); st.rerun()
+                    display_sku = get_display_sku(base_sku, master_map)
+                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), display_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
+                append_rows("Outbound", rows); st.success(f"已批量出庫 {len(rows)}，已帶中文"); st.rerun()
     st.divider()
-    st.markdown("**📜 最近出庫紀錄 (已自動補中文名) - 對應你張圖問題**")
+    st.markdown("**📜 最近出庫紀錄 (自動補中文)**")
     df_out_hist = load_df("Outbound")
     if not df_out_hist.empty:
         df_out_hist = enrich_with_master(df_out_hist, master_map)
-        # 重現你張圖格式
-        df_out_hist["顯示格式"] = df_out_hist.apply(lambda r: f"{r['SKU_base']}---{r['中文名']}" if r['中文名'] else r['SKU_base'], axis=1)
-        st.dataframe(df_out_hist[["SKU_base","顯示格式","中文名","MFD","QTY","UOM"]].tail(100).sort_index(ascending=False), use_container_width=True, height=400)
-        st.success(f"✅ 已自動補回中文名，你圖入面SPBMC023 / SPCQP006等會顯示為 {df_out_hist.iloc[-1]['顯示格式'] if len(df_out_hist)>0 else ''} 等")
-    else:
-        st.info("暫無出庫")
+        st.dataframe(df_out_hist[["SKU_base","顯示","中文名","MFD","QTY","UOM"]].tail(100).sort_index(ascending=False), use_container_width=True, height=400)
 
 with tab_view:
-    st.subheader(f"📦 總庫存 - V54.3 已修復中文名")
+    st.subheader(f"📦 總庫存 - V54.4 Stock安全")
     df_stock = get_stock_df_for_export()
     if df_stock.empty: st.info("Master未有資料")
     else: 
         show_df = df_stock[["SKU","Desc.","Code","UOM","現有庫存"]].copy()
         st.dataframe(show_df, use_container_width=True)
-        st.caption(f"共 {len(show_df)} 項，SPBMC023 / SPCQP006等中文名已從Master自動補回")
+        st.caption(f"共 {len(show_df)} 項，已自動修復空SKU，Stock計算用base Code，唔受中文影響")
 
 with tab_mfd:
-    st.subheader("📅 按MFD庫存 (自動補中文名)")
+    st.subheader("📅 按MFD庫存")
     df_stock_mfd = load_df("Stock_MFD")
     if df_stock_mfd.empty: st.info("暫無MFD庫存")
     else: st.dataframe(df_stock_mfd, use_container_width=True, height=500)
