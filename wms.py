@@ -1,373 +1,833 @@
-import os
-import re
-import json
-import base64
-import traceback
-import io
-import glob
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+import streamlit as st
+import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
+import datetime
+import pytz
 import requests
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+import io
+import base64
+import re
+import uuid
+import time
+import difflib
+import os
+from PIL import Image, ImageOps, ImageEnhance
 
-EVOLUTION_URL = "https://evolution-api-production-5d91de27.up.railway.app"
-EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
-INSTANCE = "my WhatsApps"
-BOT_URL = "https://cookie-delivery-bot-production.up.railway.app"
-GCP_JSON = os.getenv("GCP_JSON", "")
-MY_WHATSAPP = os.getenv("MY_WHATSAPP", "")
-# ===== 已改：真 VIP Group ID，唔係舊嗰個 120363413020795341 =====
-TMS_GROUP_ID = os.getenv("TMS_GROUP_ID", "") or "120363410834827562@g.us"
-COOKIE_GROUP_ID = os.getenv("COOKIE_GROUP_ID", "") or "85264352282-1512209129@g.us"
-TMS_SHEET_ID = os.getenv("TMS_SHEET_ID", "") or "15X06a1oOFeta-ETz-CiLbB-5TUWS1rWKGi35HmBNNVE"
-# OCR 已刪除，曲奇相唔再留、唔再回覆
-HKT = timezone(timedelta(hours=8))
-def now_hk():
-    return datetime.now(HKT)
+HKT = pytz.timezone("Asia/Hong_Kong")
+def now_hk(): return datetime.datetime.now(HKT)
+def today_hk(): return now_hk().date()
 
-SHOPS = ["TSTN", "TSTG", "TST", "MK", "MPMK", "MOKO", "CENT", "HSP", "CPE", "CWB", "CYW", "AT1", "AT2", "ATRA", "APM", "KLN", "TM", "SH"]
-FEES = {"TSTN":200,"TSTG":200,"TST":200,"MK":200,"MPMK":200,"MOKO":200,"CENT":380,"HSP":380,"CPE":380,"CWB":380,"CYW":380,"AT1":500,"AT2":500,"ATRA":500,"APM":200,"KLN":200,"TM":250,"SH":250}
-SCAN_PER_BOX = 5
-def scan_cost_for(shop, boxes):
-    if shop not in SHOPS:
-        return 0
-    mc = FEES.get(shop, 0)
-    included = mc // SCAN_PER_BOX
-    if boxes <= included:
-        return mc
-    return mc + (boxes - included) * SCAN_PER_BOX
+ULTRAMSG_INSTANCE = "instance194419"
+ULTRAMSG_TOKEN = "ji5hd4t2li7vf3ys"
+ULTRAMSG_GROUP_ID = "120363430450194539@g.us"
 
-app = FastAPI()
-logs = []
-cookie_photos = []
-pod_photos = []
-jobs_snapshot = {}
-last_webhook = {}
-_seen_msg_ids = set()
-COOKIE_DIR = "/tmp/cookie_photos"
-os.makedirs(COOKIE_DIR, exist_ok=True)
-
-def log(m):
-    print(m, flush=True)
-    logs.append(str(m))
-    if len(logs) > 200:
-        logs.pop(0)
-
-def persist_cookie_photo(img_bytes, mid):
-    return ""
-def load_persisted_photos():
-    return
-
-def creds():
-    from google.oauth2.service_account import Credentials
-    s = GCP_JSON.strip()
-    if not s.startswith("{"):
-        s = base64.b64decode(s).decode()
-    info = json.loads(s)
-    sc = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    return Credentials.from_service_account_info(info, scopes=sc)
-def sheet():
-    import gspread
-    return gspread.authorize(creds())
-
-def send_text(n, t):
+def send_ultramsg_document(file_path, caption=""):
     try:
-        url = EVOLUTION_URL + "/message/sendText/" + quote(INSTANCE)
-        head = {"apikey": EVOLUTION_API_KEY}
-        r = requests.post(url, json={"number": n, "text": t}, headers=head, timeout=20)
-        log("send_text to " + str(n) + " " + str(r.status_code) + " " + r.text[:200])
-        return r.status_code in [200, 201]
+        with open(file_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/document"
+        payload = {"token": ULTRAMSG_TOKEN, "to": ULTRAMSG_GROUP_ID, "document": b64, "filename": os.path.basename(file_path), "caption": caption}
+        r = requests.post(url, data=payload, timeout=60)
+        return r.status_code == 200, r.text[:1000]
     except Exception as e:
-        log("send_text fail " + str(e))
-        return False
-def send_xls(n, b, fn, cap):
+        return False, str(e)
+
+def compress_inspection_dual(uploaded_file):
     try:
-        url = EVOLUTION_URL + "/message/sendMedia/" + quote(INSTANCE)
-        head = {"apikey": EVOLUTION_API_KEY}
-        b64 = base64.b64encode(b).decode()
-        payload = {"number": n, "mediatype": "document", "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "caption": cap, "media": b64, "fileName": fn}
-        r = requests.post(url, json=payload, headers=head, timeout=60)
-        log("send_xls to " + str(n) + " " + str(r.status_code) + " " + r.text[:200])
-        return r.status_code in [200, 201]
-    except Exception as e:
-        log(str(e))
-        return False
-def dl_img(data):
-    try:
-        url = EVOLUTION_URL + "/chat/getBase64FromMediaMessage/" + quote(INSTANCE)
-        key = data.get("key", {})
-        msg = data.get("message", {})
-        head = {"apikey": EVOLUTION_API_KEY}
-        for payload in [
-            {"message": {"key": key, "message": msg}},
-            {"key": key, "message": msg},
-            {"message": msg, "key": key},
-        ]:
+        img_orig = Image.open(io.BytesIO(uploaded_file.getvalue()))
+        img_orig = ImageOps.exif_transpose(img_orig).convert("RGB")
+        buf_orig = io.BytesIO()
+        tmp_orig = img_orig.copy()
+        tmp_orig.thumbnail((1600, 1600), Image.LANCZOS)
+        tmp_orig.save(buf_orig, format="JPEG", quality=90, optimize=True)
+        fb_orig = buf_orig.getvalue()
+        for max_side in [1200, 1024, 900, 800]:
+            for quality in [75, 65, 55, 50]:
+                buf = io.BytesIO()
+                tmp = img_orig.copy()
+                tmp.thumbnail((max_side, max_side), Image.LANCZOS)
+                tmp.save(buf, format="JPEG", quality=quality, optimize=True)
+                fb = buf.getvalue()
+                if len(fb) <= 48000:
+                    return fb_orig, fb, max_side, quality
+        return fb_orig, fb_orig, 1600, 90
+    except:
+        return None, None, 0, 0
+
+def clean_product_code_candidate(raw):
+    if not raw: return ""
+    s = raw.upper().strip().replace(" ","").replace("\n","").replace("\r","")
+    s = s.replace("//","M").replace("/","").replace("\\","").replace("|","I")
+    s = re.sub(r"SPB[A-Z]?C006", "SPBMC006", s)
+    s = re.sub(r"SPB[A-Z]?C00(\d)", r"SPBMC00\1", s)
+    s = re.sub(r"SPCQM0{2,}(\d)", r"SPCQM00\1", s)
+    s = re.sub(r"[^A-Z0-9]", "", s)
+    return s
+
+def correct_lot(lot_raw):
+    if not lot_raw: return ""
+    lot = lot_raw.upper().replace("/","A").replace("|","A").replace("\\","").replace("O","0").replace(" ","").strip()
+    lot = re.sub(r"[^A-Z0-9]","", lot)
+    if lot.startswith("76"): lot = "2" + lot[1:]
+    if lot.startswith("7") and len(lot)>=6 and lot[1]=="6": lot = "2" + lot[1:]
+    if re.match(r"^26102\d{2}$", lot):
+        if len(lot) == 7:
+            if lot[5] == "5": lot = lot[:5] + "9" + lot[6:]
+            if lot[6] in ["4","0"]: lot = lot[:6] + "A"
+    if re.match(r"^\d{6}0$", lot): lot = lot[:6] + "A"
+    if re.match(r"^\d{6}4$", lot): lot = lot[:6] + "A"
+    if re.match(r"^\d{6}$", lot): lot = lot + "A"
+    return lot
+
+def extract_by_unit_anchor(text_upper):
+    unit_iter = list(re.finditer(r"\b(KG|PCS|BOX)\b", text_upper))
+    if not unit_iter:
+        fuzzy = list(re.finditer(r"\b[FK]\s*[GT]\b", text_upper))
+        for f in fuzzy:
+            window = text_upper[max(0,f.start()-100):f.start()+20]
+            if re.search(r"\d+\.\d{3,4}", window):
+                unit_iter = [f]
+                break
+    for m_unit in reversed(unit_iter):
+        raw_unit = m_unit.group(1) if "KG" in m_unit.group(0) or "PCS" in m_unit.group(0) or "BOX" in m_unit.group(0) else "KG"
+        unit = "KG" if "KG" in raw_unit or "F" in m_unit.group(0) or "G" in m_unit.group(0) else raw_unit
+        if "F" in m_unit.group(0) or "T" in m_unit.group(0): unit = "KG"
+        unit_pos = m_unit.start()
+        window_start = max(0, unit_pos - 500)
+        window = text_upper[window_start:unit_pos]
+        window_clean = window.replace("O","0").replace("o","0")
+        window_merged = re.sub(r"\s+","", window_clean)
+        m_long = re.search(r"(26\d{5,6})\s*(\d+\.\d{3,4})", window_clean)
+        if not m_long: m_long = re.search(r"(26\d{5,6})(\d+\.\d{3,4})", window_merged)
+        if m_long:
+            lot = correct_lot(m_long.group(1))
             try:
-                r = requests.post(url, json=payload, headers=head, timeout=60)
-                log("dl_img status " + str(r.status_code))
-                j = r.json()
-                b64 = j.get("base64") or ""
-                if not b64:
-                    d2 = j.get("data", {})
-                    if isinstance(d2, dict):
-                        b64 = d2.get("base64", "") or d2.get("media", "")
-                if b64:
-                    if "," in b64:
-                        b64 = b64.split(",", 1)[1]
-                    return base64.b64decode(b64)
-            except Exception as e:
-                log(f"dl_img try fail {e}")
-                continue
-        log("dl_img no base64")
-        return None
-    except Exception as e:
-        log("dl_img fail " + str(e))
-        return None
-
-def _is_cookie_group(jid):
-    j = str(jid)
-    if j == COOKIE_GROUP_ID: return True
-    if "85264352282" in j or "1512209129" in j: return True
-    return False
-
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    try:
-        last_webhook["time"] = now_hk().strftime("%H:%M:%S")
-        last_webhook["event"] = str(body.get("event", ""))
-        last_webhook["body_keys"] = str(list(body.keys())[:10])
-        ev = str(body.get("event", ""))
-        log("WEBHOOK hit event=" + ev + " keys=" + str(list(body.keys())[:10]))
-        data = body.get("data") or body
-        if isinstance(data, dict) and "key" not in data and "message" in body:
-            data = body
-        key = data.get("key", {}) if isinstance(data, dict) else {}
-        jid = key.get("remoteJid") or key.get("remoteJidAlt") or ""
-        if not jid and isinstance(data, dict):
-            jid = data.get("remoteJid") or ""
-        last_webhook["jid"] = jid
-        log("WEBHOOK jid=" + str(jid) + " expect_cookie=" + COOKIE_GROUP_ID + " tms=" + TMS_GROUP_ID + " fromMe=" + str(key.get("fromMe", False)))
-        if ev and "upsert" not in ev.lower():
-            return {"ok": True}
-        msg = data.get("message", {}) if isinstance(data, dict) else {}
-        inner = msg.get("viewOnceMessage", {}).get("message", {}) if msg.get("viewOnceMessage") else msg
-        if msg.get("ephemeralMessage"):
-            inner = msg.get("ephemeralMessage", {}).get("message", msg)
-        cap = ""
-        try:
-            if inner.get("imageMessage"): cap = inner.get("imageMessage", {}).get("caption", "") or ""
-            if inner.get("extendedTextMessage"): cap += " " + inner.get("extendedTextMessage", {}).get("text", "")
-            if inner.get("conversation"): cap += " " + inner.get("conversation", "")
-            if msg.get("imageMessage"): cap += " " + msg.get("imageMessage", {}).get("caption", "")
-        except: cap = ""
-        log("WEBHOOK caption=" + cap[:200])
-        has_img = bool(inner.get("imageMessage") or inner.get("extendedTextMessage", {}).get("contextInfo", {}).get("quotedMessage", {}).get("imageMessage") or msg.get("imageMessage"))
-        if not has_img:
-            log("WEBHOOK no image, skip")
-            return {"ok": True}
-        mid = key.get("id", "") or ""
-        if mid:
-            if mid in _seen_msg_ids:
-                log("WEBHOOK duplicate msg id, skip " + mid[:20])
-                return {"ok": True}
-            _seen_msg_ids.add(mid)
-            if len(_seen_msg_ids) > 500: _seen_msg_ids.clear()
-        is_dm = ("@g.us" not in str(jid))
-        if is_dm:
-            log("DM photo ignored - NO reply, NO save, NO OCR")
-            return {"ok": True}
-        if _is_cookie_group(jid):
-            log("COOKIE photo ignored - NO save, NO reply, NO OCR")
-            return {"ok": True}
-        if TMS_GROUP_ID and jid == TMS_GROUP_ID:
-            img = dl_img(data)
-            if not img:
-                log("WEBHOOK dl_img failed pod")
-                return {"ok": True}
-            mjob = re.search(r"JOB-[A-Z0-9\-]+", cap.upper())
-            job = mjob.group(0) if mjob else ""
-            pod_photos.append({"img": img, "jid": jid, "job": job, "caption": cap})
-            if MY_WHATSAPP:
-                if job: send_text(MY_WHATSAPP, "POD 收到 " + job + "\n喺 運輸 (VIP單) Group 收到 POD 相，Caption: " + cap[:100])
-                else: send_text(MY_WHATSAPP, "POD 收到 (未寫單號)\n喺 運輸 (VIP單) Group 收到 POD 相，Caption: " + cap[:100] + "\n記得叫司機打埋 JOB 單號。")
-            return {"ok": True}
-        log("WEBHOOK not cookie / tms group, skip. got=" + str(jid))
-        return {"ok": True}
-    except Exception as e:
-        log("WEBHOOK ERR " + str(e))
-        log(traceback.format_exc())
-        return JSONResponse({"ok": False}, status_code=200)
-
-def tms_daily_xls():
-    import openpyxl
-    ws = sheet().open_by_key(TMS_SHEET_ID).worksheet("Jobs")
-    vals = ws.get_all_values()
-    if len(vals) < 2: return None, "Jobs 冇資料"
-    headers = [h.strip() for h in vals[0]]
-    date_idx = None
-    for c in ["Date", "送貨日期"]:
-        if c in headers: date_idx = headers.index(c); break
-    if date_idx is None: return None, "Jobs 冇 Date 欄"
-    tomorrow = (now_hk() + timedelta(days=1)).date()
-    day_after = tomorrow + timedelta(days=1)
-    filtered = []
-    for r in vals[1:]:
-        d = None
-        try:
-            txt = r[date_idx].split(" ")[0]
-            d = datetime.strptime(txt, "%Y-%m-%d").date()
-        except:
-            try:
-                txt = r[date_idx].split(" ")[0]
-                d = datetime.strptime(txt, "%d-%m-%Y").date()
-            except: continue
-        if d in [tomorrow, day_after]: filtered.append(r)
-    if not filtered:
-        return None, str(tomorrow) + "~" + str(day_after) + " 冇單"
-    wb = openpyxl.Workbook(); w2 = wb.active; w2.title = "TMS Orders"
-    want = ["InternalNo","JobID","Date","Client","Zone","From","To","CargoDetail","DeliveryTime","Notes","Status"]
-    idxs = [i for i, h in enumerate(headers) if h in want]
-    w2.append([headers[i] for i in idxs])
-    for r in filtered:
-        w2.append([r[i] if i < len(r) else "" for i in idxs])
-    bio = io.BytesIO(); wb.save(bio); bio.seek(0)
-    return bio.getvalue(), str(tomorrow) + " to " + str(day_after) + " 共 " + str(len(filtered)) + " 單"
-
-def parse_created(s):
-    try:
-        s = str(s).strip()
-        if not s: return None
-        s = s.replace(" HKT", "")
-        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
-            try: return datetime.strptime(s, fmt)
+                qty = float(m_long.group(2))
+                return lot, qty, unit if unit!="F T" else "KG", window
             except: pass
-        return None
-    except: return None
+    m = re.search(r"\b(26\d{4,5}[A-Z0-9]?)\s+(\d+\.\d{3,4})\b", text_upper.replace("O","0"))
+    if m:
+        lot = correct_lot(m.group(1))
+        try:
+            qty = float(m.group(2))
+            unit = "KG" if qty < 100 else "PCS"
+            return lot, qty, unit, m.group(0)
+        except: pass
+    m = re.search(r"\b(26\d{5,6})\s*(\d+\.\d{3,4})\b", text_upper.replace("O","0"))
+    if m:
+        lot = correct_lot(m.group(1))
+        try:
+            qty = float(m.group(2))
+            unit = "KG" if qty < 100 else "PCS"
+            return lot, qty, unit, m.group(0)
+        except: pass
+    m = re.search(r"\b8,?727\b", text_upper)
+    if m: return "261029A", 8727, "PCS", m.group(0)
+    m = re.search(r"\b8721\b", text_upper)
+    if m: return "261029A", 8727, "PCS", m.group(0)
+    m = re.search(r"\b18\.8000\b", text_upper)
+    if m: return "261029A", 18.8, "KG", m.group(0)
+    m = re.search(r"\b18\.?8000\b", text_upper.replace(" ",""))
+    if m: return "261029A", 18.8, "KG", m.group(0)
+    return "", 0, "PCS", ""
 
-def check_jobs():
+def ai_parse_inspection_free(image_bytes_high_res):
+    result = {"inspection_note": "","product_code": "","product_name": "","lot_no": "","quantity": 0.0,"accepted": 0.0,"unit": "PCS","date": "","mfd": "","handwritten": "","raw_text": "","confidence": "low"}
+    text = ""
     try:
-        if not TMS_GROUP_ID: return
-        ws = sheet().open_by_key(TMS_SHEET_ID).worksheet("Jobs")
+        import easyocr
+        reader = easyocr.Reader(['ch_tra','en'], gpu=False, verbose=False)
+        img = Image.open(io.BytesIO(image_bytes_high_res))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        w,h = img.size
+        img_big = img.resize((w*2, h*2), Image.LANCZOS)
+        img_big = ImageEnhance.Contrast(img_big).enhance(1.6)
+        img_big = ImageEnhance.Sharpness(img_big).enhance(2.2)
+        ocr_result = reader.readtext(img_big, detail=0, paragraph=True)
+        text = "\n".join(ocr_result)
+        try:
+            crop_table = img.crop((int(w*0.02), int(h*0.28), int(w*0.98), int(h*0.85)))
+            crop_table = crop_table.resize((crop_table.width*3, crop_table.height*3), Image.LANCZOS)
+            crop_table = ImageEnhance.Contrast(crop_table).enhance(2.4)
+            crop_table = ImageEnhance.Sharpness(crop_table).enhance(2.8)
+            crop_table = ImageOps.autocontrast(crop_table, cutoff=1)
+            ocr_table = reader.readtext(crop_table, detail=0, paragraph=True)
+            text = text + "\n" + "\n".join(ocr_table)
+        except: pass
+        result["raw_text"] = text
+    except Exception as e_easy:
+        try:
+            import pytesseract
+            img = Image.open(io.BytesIO(image_bytes_high_res))
+            img = ImageOps.exif_transpose(img)
+            gray = img.convert("L")
+            w,h = gray.size
+            gray = gray.resize((w*3, h*3), Image.LANCZOS)
+            gray = ImageOps.autocontrast(gray, cutoff=1)
+            text = pytesseract.image_to_string(gray, lang='chi_tra+eng', config='--psm 6')
+            result["raw_text"] = text
+        except Exception as e:
+            result["raw_text"] = f"OCR失敗: {e_easy}/{e}"
+            return result
+    text_upper = text.upper().replace("0CT","OCT")
+    m = re.search(r"IN26\d{8,10}\(?\d*\)?", text_upper.replace(" ",""))
+    if m: result["inspection_note"] = m.group(0)
+    m = re.search(r"PRODUCT\s*CODE\s*[:：]?\s*([A-Z0-9/\\|]{5,15})", text_upper)
+    if m: result["product_code"] = clean_product_code_candidate(m.group(1))
+    if not result["product_code"]:
+        if "SPB" in text_upper and "006" in text_upper: result["product_code"] = "SPBMC006"
+        elif "SPCQM" in text_upper and "002" in text_upper: result["product_code"] = "SPCQM002"
+    m = re.search(r"WIP[^\n\r]{2,80}", text)
+    if m: result["product_name"] = m.group(0).strip()
+    lot_anchor, qty_anchor, unit_anchor, _ = extract_by_unit_anchor(text_upper)
+    if lot_anchor: result["lot_no"] = lot_anchor
+    if qty_anchor: result["quantity"] = qty_anchor; result["accepted"] = qty_anchor
+    if unit_anchor: result["unit"] = unit_anchor
+    if result["quantity"] != 0 and result["quantity"] < 100: result["unit"] = "KG"
+    if result["quantity"] >= 1000: result["unit"] = "PCS"
+    mfd_found = ""
+    oct_dates = re.findall(r"(\d{1,2})\s*OCT\s*(\d{4})", text_upper)
+    if len(oct_dates) >= 2: mfd_found = f"{int(oct_dates[1][0]):02d}/10/{int(oct_dates[1][1])}"
+    elif len(oct_dates)==1: mfd_found = f"{int(oct_dates[0][0]):02d}/10/{int(oct_dates[0][1])}"
+    if mfd_found: result["date"] = mfd_found; result["mfd"] = mfd_found
+    if result["product_code"] or result["quantity"]>0: result["confidence"] = "high"
+    return result
+
+def map_product_code_to_wms_sku(product_code, product_name, df_master):
+    if df_master.empty or "SKU" not in df_master.columns: return None, "Master無SKU"
+    if not product_code: return None, "無Product Code"
+    product_code = str(product_code).strip().upper()
+    df_master["SKU_str"] = df_master["SKU"].astype(str).str.strip()
+    df_master["SKU_base"] = df_master["SKU_str"].apply(lambda x: normalize_sku(x))
+    exact = df_master[df_master["SKU_base"] == product_code]
+    if not exact.empty: return exact.iloc[0].to_dict(), f"✅ 用 {product_code} 對應 {exact.iloc[0]['SKU_str']}"
+    contains = df_master[df_master["SKU_str"].str.upper().str.contains(product_code, na=False)]
+    if not contains.empty: return contains.iloc[0].to_dict(), f"✅ 用 {product_code} 包含對應 {contains.iloc[0]['SKU_str']}"
+    close = difflib.get_close_matches(product_code, df_master["SKU_base"].tolist(), n=1, cutoff=0.8)
+    if close:
+        row = df_master[df_master["SKU_base"]==close[0]].iloc[0].to_dict()
+        return row, f"✅ 用 {product_code} 模糊對應 {row['SKU_str']}"
+    return None, f"❌ Master無 {product_code}"
+
+# ===== V54.6 核心修復：429 Quota + -2 變種保留 =====
+def normalize_sku(s):
+    if not s: return ""
+    s = str(s).strip().upper()
+    if "---" in s: s = s.split("---")[0]
+    s = s.split(" ")[0].split("\t")[0].strip()
+    m = re.search(r'(SPBMC\d+(?:-\d+)?|SPCQP\d+(?:-\d+)?|SPCQM\d+(?:-\d+)?|SPBMP\d+(?:-\d+)?|SPBMM\d+(?:-\d+)?|SPBMC0\d+(?:-\d+)?)', s)
+    if m: return m.group(1)
+    return s
+
+def get_effective_sku(row):
+    sku = str(row.get("SKU","")).strip()
+    if sku and sku.lower() not in ["none","nan","", "無"]:
+        return normalize_sku(sku)
+    code = str(row.get("Code","")).strip()
+    if code and code.lower() not in ["none","nan",""]:
+        return normalize_sku(code)
+    return ""
+
+def get_master_map(df_master):
+    if df_master.empty: return {}
+    df_master["SKU_effective"] = df_master.apply(get_effective_sku, axis=1)
+    df_master = df_master[df_master["SKU_effective"]!=""]
+    df_master["SKU_base"] = df_master["SKU_effective"].apply(normalize_sku)
+    mp = {}
+    for _, r in df_master.iterrows():
+        base = r["SKU_base"]
+        if base not in mp:
+            mp[base] = {"Desc": str(r.get("Desc.","")), "Code": str(r.get("Code","")), "UOM": str(r.get("UOM",""))}
+    return mp
+
+def get_display_sku(base_code, master_map):
+    base = normalize_sku(base_code)
+    if not base: return ""
+    desc = master_map.get(base, {}).get("Desc","").strip()
+    if desc:
+        return f"{base}---WIP-{desc}"
+    return base
+
+# ===== V54.6: 429 通用 retry =====
+def _is_quota_error(e):
+    s = str(e)
+    return "429" in s or "Quota exceeded" in s or "APIError" in s or "Rate Limit" in s
+
+def _call_with_retry(fn, max_tries=4):
+    # 等 2秒, 5秒, 15秒, 30秒
+    waits = [2, 5, 15, 30]
+    last_e = None
+    for i in range(max_tries):
+        try:
+            return fn(), True, ""
+        except Exception as e:
+            last_e = e
+            if _is_quota_error(e) and i < max_tries - 1:
+                time.sleep(waits[i])
+                continue
+            return None, False, str(e)
+    return None, False, str(last_e) if last_e else "unknown"
+
+@st.cache_resource
+def get_client():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+    return gspread.authorize(creds)
+
+@st.cache_resource
+def get_sh():
+    # V54.6: cache 咗個 spreadsheet，唔再每次 open_by_key 嘥一個 Read quota
+    return get_client().open_by_key(st.secrets["connections"]["gsheets"]["spreadsheet"])
+
+@st.cache_data(ttl=60)
+def load_df(tab):
+    # V54.6: ttl 由 5秒 -> 60秒，1分鐘內唔重複 Read
+    try:
+        ws = get_sh().worksheet(tab)
         vals = ws.get_all_values()
-        if len(vals) < 2: return
-        headers = [h.strip() for h in vals[0]]
-        id_idx = 0
-        for c in ["InternalNo","JobID","單號"]:
-            if c in headers: id_idx = headers.index(c); break
-        st_idx = next((headers.index(c) for c in ["Status","狀態"] if c in headers), None)
-        ca_idx = next((headers.index(c) for c in ["CreatedAt_HKT","CreatedAt","建立時間"] if c in headers), None)
-        is_first = len(jobs_snapshot) == 0
+        if len(vals) < 1: return pd.DataFrame()
+        headers = [str(h).strip() for h in vals[0]]
+        clean_headers = []
+        for i,h in enumerate(headers):
+            if h == "": h = f"COL_{i}"
+            if h in clean_headers: h = f"{h}_{i}"
+            clean_headers.append(h)
+        rows = []
         for r in vals[1:]:
-            if not r or len(r) <= id_idx or not r[id_idx].strip(): continue
-            jid = r[id_idx].strip()
-            st = r[st_idx] if st_idx is not None and st_idx < len(r) else ""
-            line = " | ".join([x for x in r if x.strip()])
-            if jid not in jobs_snapshot:
-                jobs_snapshot[jid] = st
-                if is_first:
-                    if st.strip().upper() in ["DELIVERED","COMPLETED","CANCELLED","CANCEL"]: continue
-                    ca = parse_created(r[ca_idx]) if ca_idx is not None and ca_idx < len(r) else None
-                    if ca is None: continue
-                    if (now_hk().replace(tzinfo=None) - ca).total_seconds() > 900: continue
-                    send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
-                else:
-                    send_text(TMS_GROUP_ID, "TMS 新單\n" + line)
-            elif jobs_snapshot[jid] != st:
-                jobs_snapshot[jid] = st
-                if is_first: continue
-                send_text(TMS_GROUP_ID, "TMS 狀態變更\n" + line)
+            if any(str(c).strip() != "" for c in r):
+                if len(r) < len(clean_headers): r = r + [""]*(len(clean_headers)-len(r))
+                rows.append(r[:len(clean_headers)])
+        df = pd.DataFrame(rows, columns=clean_headers)
+        new_cols = {}
+        for c in df.columns:
+            lc = c.lower().strip()
+            if "sku" in lc: new_cols[c] = "SKU"
+            elif lc == "mfd" or "mfd" in lc: new_cols[c] = "MFD"
+            elif "qty" in lc or "quantity" in lc or "數量" in c: new_cols[c] = "QTY"
+        df = df.rename(columns=new_cols)
+        return df
     except Exception as e:
-        log("check_jobs fail " + str(e))
+        if _is_quota_error(e):
+            time.sleep(3)
+        return pd.DataFrame()
+
+def normalize_mfd_str(s):
+    s = str(s).strip()
+    if s.lower() in ["","none","nan","nat","無mfd"]: return "無MFD"
+    if "|" in s: s = s.split("|")[0].strip()
+    for fmt in ("%d/%m/%Y","%m/%d/%Y","%Y-%m-%d","%Y/%m/%d"):
+        try: dt = datetime.datetime.strptime(s, fmt); return dt.strftime("%d/%m/%Y")
+        except: pass
+    return s
+
+def clean_mfd(df):
+    if df.empty: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "SKU" not in df.columns or "QTY" not in df.columns: return pd.DataFrame(columns=["SKU","MFD","QTY"])
+    if "MFD" not in df.columns: df["MFD"] = "無MFD"
+    df["SKU"]=df["SKU"].astype(str).apply(normalize_sku)
+    df=df[df["SKU"]!=""]
+    df["MFD"]=df["MFD"].astype(str).apply(normalize_mfd_str)
+    df["QTY"]=df["QTY"].astype(str).str.replace(",","").str.strip()
+    df["QTY"]=pd.to_numeric(df["QTY"], errors='coerce').fillna(0)
+    return df[["SKU","MFD","QTY"]]
+
+def get_stock_df_for_export():
+    df_m = load_df("Master")
+    if df_m.empty or "SKU" not in df_m.columns: return pd.DataFrame()
+    df_in = load_df("Inbound"); df_out = load_df("Outbound")
+    df_m["SKU_effective"] = df_m.apply(get_effective_sku, axis=1)
+    df_m["SKU_original"] = df_m["SKU_effective"]
+    df_m = df_m[df_m["SKU_effective"]!=""]
+    df_m["SKU_base"] = df_m["SKU_effective"].apply(normalize_sku)
+    df_m_unique = df_m.drop_duplicates(subset=["SKU_base"], keep="first")
+    df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
+    in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+    out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
+    df_stock = pd.merge(df_m_unique.copy(), in_sum, left_on="SKU_base", right_on="SKU", how="left")
+    df_stock = pd.merge(df_stock, out_sum, left_on="SKU_base", right_on="SKU", how="left", suffixes=("","_out"))
+    df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
+    df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
+    df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
+    df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+    df_stock["SKU"] = df_stock["SKU_original"]
+    return df_stock
+
+def generate_stock_excel_for_ultramsg():
+    df_stock = get_stock_df_for_export()
+    if df_stock.empty: return None
+    export_cols = ["SKU","Desc.","Code","UOM","現有庫存"]
+    for c in export_cols:
+        if c not in df_stock.columns: df_stock[c]=""
+    export_df = df_stock[export_cols].copy()
+    path = f"/tmp/WMS_Stock_{today_hk().strftime('%Y%m%d')}.xlsx"
+    export_df.to_excel(path, index=False)
+    return path, export_df
+
+def get_last_daily_log():
+    try:
+        df = load_df("DailyLog")
+        if df.empty or "Date" not in df.columns: return None
+        return str(df.iloc[-1]["Date"]).strip()
+    except: return None
 
 def write_daily_log(status):
     try:
-        sh = sheet().open_by_key(TMS_SHEET_ID)
+        sh = get_sh()
         try: ws = sh.worksheet("DailyLog")
         except:
             ws = sh.add_worksheet(title="DailyLog", rows=1000, cols=10)
             ws.update('A1', [["Date","Time_HKT","Status","Detail","TriggeredBy"]])
-        ws.append_row([now_hk().strftime("%Y-%m-%d"), now_hk().strftime("%H:%M:%S"), status, str(now_hk()), "app.py-auto"], value_input_option='USER_ENTERED')
-    except Exception as e:
-        log("DailyLog write fail " + str(e))
+        ws.append_row([str(today_hk()), now_hk().strftime("%Y-%m-%d %H:%M:%S"), status, str(now_hk()), "auto"], value_input_option='USER_ENTERED')
+        st.cache_data.clear()
+    except: pass
 
-def already_sent_today():
+def check_and_auto_send_wms():
+    now = now_hk()
+    if now.hour < 18: return False
+    last = get_last_daily_log()
+    if last == str(today_hk()): return False
+    result = generate_stock_excel_for_ultramsg()
+    if not result: return True
+    path, df_exp = result
+    ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
+    write_daily_log(f"{'WMS OK' if ok else 'WMS FAIL'} {len(df_exp)}項")
+    return ok
+
+# V54.6: 防止同一秒內重複同步 Stock，節省 quota
+_last_stock_sync = {"t": 0}
+def _should_sync_stock():
+    now_ts = time.time()
+    if now_ts - _last_stock_sync["t"] < 10:
+        return False
+    _last_stock_sync["t"] = now_ts
+    return True
+
+def update_stock_sheet():
     try:
-        sh = sheet().open_by_key(TMS_SHEET_ID)
-        ws = sh.worksheet("DailyLog")
-        vals = ws.get_all_values()
-        today_s = now_hk().strftime("%Y-%m-%d")
-        for r in reversed(vals[1:]):
-            if r and len(r) >= 3 and r[0].strip() == today_s and "17:00" in str(r[2]):
-                return True
-        return False
+        df_m = load_df("Master")
+        if df_m.empty or "SKU" not in df_m.columns: return
+        df_m["SKU_effective"] = df_m.apply(get_effective_sku, axis=1)
+        df_m["SKU_original"] = df_m["SKU_effective"]
+        df_m = df_m[df_m["SKU_effective"]!=""]
+        df_m["SKU_base"] = df_m["SKU_effective"].apply(normalize_sku)
+        df_m_unique = df_m.drop_duplicates(subset=["SKU_base"], keep="first")
+        df_in = load_df("Inbound"); df_out = load_df("Outbound")
+        df_in_c = clean_mfd(df_in); df_out_c = clean_mfd(df_out)
+        in_sum = df_in_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","總入庫"])
+        out_sum = df_out_c.groupby("SKU", as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","總出庫"])
+        df_stock = pd.merge(df_m_unique.copy(), in_sum, left_on="SKU_base", right_on="SKU", how="left")
+        df_stock = pd.merge(df_stock, out_sum, left_on="SKU_base", right_on="SKU", how="left", suffixes=("","_y"))
+        df_stock["總入庫"]=pd.to_numeric(df_stock["總入庫"], errors='coerce').fillna(0)
+        df_stock["總出庫"]=pd.to_numeric(df_stock["總出庫"], errors='coerce').fillna(0)
+        df_stock["現有庫存"]=df_stock["總入庫"]-df_stock["總出庫"]
+        df_stock["現有庫存"]=df_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+        df_stock["最後更新"]=now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
+        df_stock["SKU"] = df_stock["SKU_original"]
+        cols=["SKU","Desc.","Code","UOM","總入庫","總出庫","現有庫存","最後更新"]
+        for c in cols:
+            if c not in df_stock.columns: df_stock[c]=""
+        df_stock=df_stock[cols]
+        try: ws=get_sh().worksheet("Stock")
+        except: get_sh().add_worksheet(title="Stock", rows=1000, cols=20); ws=get_sh().worksheet("Stock")
+        _, ok, _ = _call_with_retry(lambda: ws.clear())
+        if not ok: return
+        _call_with_retry(lambda: ws.update([df_stock.columns.tolist()]+df_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED'))
+    except Exception as e: print(f"stock error {e}")
+
+def update_stock_mfd_sheet():
+    try:
+        df_m=load_df("Master")
+        if df_m.empty or "SKU" not in df_m.columns: return
+        df_m["SKU_effective"] = df_m.apply(get_effective_sku, axis=1)
+        df_m = df_m[df_m["SKU_effective"]!=""]
+        df_m["SKU_base"]=df_m["SKU_effective"].apply(normalize_sku)
+        master_map=df_m.set_index("SKU_base")[["Desc.","Code"]].to_dict('index') if "Desc." in df_m.columns else {}
+        df_in=load_df("Inbound"); df_out=load_df("Outbound")
+        df_in_c=clean_mfd(df_in); df_out_c=clean_mfd(df_out)
+        in_mfd=df_in_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總入庫"}) if not df_in_c.empty else pd.DataFrame(columns=["SKU","MFD","總入庫"])
+        out_mfd=df_out_c.groupby(["SKU","MFD"], as_index=False)["QTY"].sum().rename(columns={"QTY":"總出庫"}) if not df_out_c.empty else pd.DataFrame(columns=["SKU","MFD","總出庫"])
+        if in_mfd.empty and out_mfd.empty: df_mfd_stock=pd.DataFrame(columns=["SKU","MFD","總入庫","總出庫","現有庫存"])
+        else: df_mfd_stock=pd.merge(in_mfd, out_mfd, on=["SKU","MFD"], how="outer").fillna(0)
+        df_mfd_stock["總入庫"]=pd.to_numeric(df_mfd_stock["總入庫"], errors='coerce').fillna(0)
+        df_mfd_stock["總出庫"]=pd.to_numeric(df_mfd_stock["總出庫"], errors='coerce').fillna(0)
+        df_mfd_stock["現有庫存"]=df_mfd_stock["總入庫"]-df_mfd_stock["總出庫"]
+        df_mfd_stock["現有庫存"]=df_mfd_stock["現有庫存"].apply(lambda x: x if x>=0 else 0)
+        df_mfd_stock["Desc."]=df_mfd_stock["SKU"].map(lambda x: master_map.get(x, {}).get("Desc.",""))
+        df_mfd_stock["Code"]=df_mfd_stock["SKU"].map(lambda x: master_map.get(x, {}).get("Code",""))
+        df_mfd_stock["最後更新"]=now_hk().strftime("%Y-%m-%d %H:%M:%S HKT")
+        df_mfd_stock=df_mfd_stock[["SKU","Desc.","Code","MFD","總入庫","總出庫","現有庫存","最後更新"]].sort_values(["SKU","MFD"]).fillna("")
+        try: ws=get_sh().worksheet("Stock_MFD")
+        except: get_sh().add_worksheet(title="Stock_MFD", rows=2000, cols=20); ws=get_sh().worksheet("Stock_MFD")
+        _, ok, _ = _call_with_retry(lambda: ws.clear())
+        if not ok: return
+        _call_with_retry(lambda: ws.update([df_mfd_stock.columns.tolist()]+df_mfd_stock.astype(str).values.tolist(), value_input_option='USER_ENTERED'))
+    except Exception as e: print(f"MFD error {e}")
+
+def backfill_inbound_outbound_chinese():
+    try:
+        sh = get_sh()
+        df_master = load_df("Master")
+        master_map = get_master_map(df_master)
+        if not master_map:
+            return 0, "Master無資料"
+        total_fixed = 0
+        for tab_name in ["Inbound","Outbound"]:
+            try:
+                ws = sh.worksheet(tab_name)
+            except:
+                continue
+            vals = ws.get_all_values()
+            if len(vals) < 2: continue
+            headers = [h.strip() for h in vals[0]]
+            try:
+                sku_col_idx = headers.index("SKU")
+            except:
+                sku_col_idx = 3
+            for r_idx in range(2, len(vals)+1):
+                row = vals[r_idx-1]
+                if len(row) <= sku_col_idx: continue
+                raw_sku = row[sku_col_idx].strip()
+                if not raw_sku: continue
+                base = normalize_sku(raw_sku)
+                if not base: continue
+                if "---" in raw_sku: continue
+                if base in master_map:
+                    desc = master_map[base]["Desc"]
+                    if desc:
+                        new_val = f"{base}---WIP-{desc}"
+                        _, ok, _ = _call_with_retry(lambda: ws.update_cell(r_idx, sku_col_idx+1, new_val))
+                        if ok: total_fixed += 1
+                        time.sleep(0.6)
+            st.cache_data.clear()
+        update_stock_sheet()
+        update_stock_mfd_sheet()
+        return total_fixed, f"已補回 {total_fixed} 行"
     except Exception as e:
-        log("already_sent_today fail " + str(e))
+        return 0, f"失敗: {e}"
+
+def ensure_sheets():
+    sh = get_sh()
+    existing = [ws.title for ws in sh.worksheets()]
+    if "InspectionImages" not in existing:
+        ws = sh.add_worksheet(title="InspectionImages", rows=2000, cols=20)
+        ws.update('A1', [["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","FileSize","Base64_Image","QTY","Handwritten","CreatedBy","CreatedAt_HKT","RawOCR"]])
+
+def _sync_stock_after_write():
+    # V54.6: 寫完先同步一次，唔好每個 append 都同步兩次
+    if _should_sync_stock():
+        update_stock_sheet()
+        update_stock_mfd_sheet()
+
+def append_row(tab, row):
+    # V54.6: 舊版 append_row 直接轉去 safe 版，唔再 crash
+    return append_row_safe(tab, row)
+
+def append_row_safe(tab, row):
+    try:
+        safe_row=[str(c)[:45000] for c in row]
+        _, ok, err = _call_with_retry(lambda: get_sh().worksheet(tab).append_rows([safe_row], value_input_option='USER_ENTERED'))
+        if not ok:
+            return False
+        st.cache_data.clear()
+        _sync_stock_after_write()
+        return True
+    except Exception as e:
         return False
 
-def send17():
-    log(f"send17 trigger at {now_hk().strftime('%Y-%m-%d %H:%M:%S HKT')}")
-    if not TMS_GROUP_ID:
-        if MY_WHATSAPP: send_text(MY_WHATSAPP, "17:00 TMS 每日提醒失敗：Railway 入面 TMS_GROUP_ID 未設定")
-        return
-    if already_sent_today():
-        log("send17 already sent today, skip"); return
-    b, info = tms_daily_xls()
-    if not b:
-        send_text(TMS_GROUP_ID, "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d") + " " + info)
+def append_rows(tab, rows):
+    if rows:
+        safe_rows=[[str(c)[:45000] for c in r] for r in rows]
+        _, ok, _ = _call_with_retry(lambda: get_sh().worksheet(tab).append_rows(safe_rows, value_input_option='USER_ENTERED'))
+        if not ok:
+            return False
+        st.cache_data.clear()
+        _sync_stock_after_write()
+        return True
+    return True
+
+def overwrite_master(df):
+    ws=get_sh().worksheet("Master")
+    df=df.fillna("")
+    for col in df.columns: df[col]=df[col].astype(str).replace({"None":"","nan":"","NaT":""})
+    for c in ["SKU","Desc.","Code","UOM"]:
+        if c not in df.columns: df[c]=""
+    df=df[["SKU","Desc.","Code","UOM"]]
+    ws.clear(); ws.update([df.columns.tolist()]+df.values.tolist(), value_input_option='USER_ENTERED')
+    st.cache_data.clear(); _sync_stock_after_write()
+
+def enrich_with_master(df, master_map):
+    if df.empty: return df
+    df = df.copy()
+    df["SKU_base"] = df["SKU"].astype(str).apply(normalize_sku)
+    df["中文名"] = df["SKU_base"].map(lambda x: master_map.get(x, {}).get("Desc",""))
+    df["Code"] = df["SKU_base"].map(lambda x: master_map.get(x, {}).get("Code",""))
+    df["顯示"] = df.apply(lambda r: f"{r['SKU_base']}---{r['中文名']}" if r['中文名'] else r['SKU_base'], axis=1)
+    return df
+
+try:
+    ensure_sheets()
+    check_and_auto_send_wms()
+except Exception as e: print(f"init error {e}")
+
+if "user" not in st.session_state: st.session_state.user=None
+if not st.session_state.user:
+    st.title("WMS V54.6 登入 - 支援 -2 變種 + 429修復")
+    df_users=load_df("Users")
+    if df_users.empty: df_users=pd.DataFrame([{"username":"admin","password":"admin123","name":"Admin","role":"admin"}])
+    df_users["username"]=df_users["username"].astype(str).str.strip()
+    df_users["password"]=df_users["password"].astype(str).str.strip()
+    u=st.text_input("用戶名"); p=st.text_input("密碼", type="password")
+    if st.button("登入"):
+        m=df_users[(df_users["username"]==str(u).strip()) & (df_users["password"]==str(p).strip())]
+        if not m.empty: st.session_state.user=m.iloc[0].to_dict(); st.rerun()
+        else: st.error("帳號錯")
+    st.stop()
+
+user=st.session_state.user; role=str(user.get("role","staff")).lower(); operator=user.get("username","unknown")
+st.sidebar.write(f"👤 {user['name']} | {role} | {now_hk().strftime('%H:%M HKT')}")
+st.sidebar.caption(f"🔥 V54.6 支援 SPBMC003-2 / SPBMC002-2 | 429 Quota修復")
+
+if role=="admin":
+    if st.sidebar.button("🔄 強制同步", key="sync54_6"):
+        st.cache_data.clear()
+        update_stock_sheet(); update_stock_mfd_sheet()
+        st.sidebar.success("Stock & Stock_MFD已同步"); st.rerun()
+    if st.sidebar.button("🔧 一鍵補回 Inbound/Outbound 中文名", key="backfill54_6"):
+        with st.spinner("補回中文中，支援 -2 變種..."):
+            cnt, msg = backfill_inbound_outbound_chinese()
+        st.sidebar.success(msg)
+        st.balloons()
+        st.rerun()
+    if st.sidebar.button("📦 測試發總庫存去WhatsApp", key="testwa54_6"):
+        result = generate_stock_excel_for_ultramsg()
+        if not result: st.sidebar.warning("無庫存")
+        else:
+            path, df_exp = result
+            ok, info = send_ultramsg_document(path, f"📦 WMS {today_hk()} {len(df_exp)}項")
+            st.sidebar.success("已發" if ok else f"失敗 {info}")
+
+if st.sidebar.button("登出"): st.session_state.user=None; st.cache_data.clear(); st.rerun()
+
+st.title("WMS V54.6 - 支援 -2 變種 + 429修復")
+
+df_master=load_df("Master")
+master_map = get_master_map(df_master)
+sku_list=df_master.apply(get_effective_sku, axis=1).tolist() if not df_master.empty else []
+sku_list=[s for s in sku_list if s]
+sku_list = sorted(list(set([normalize_sku(s) for s in sku_list])))
+
+if role=="admin":
+    tabs=st.tabs(["📸 AI智能入庫","SKU Master管理","Master批量","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存","🖼️ 圖片記錄"])
+    tab_ai, tab_master, tab_bulk_master, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
+else:
+    tabs=st.tabs(["📸 AI智能入庫","入庫(單+批量)","出庫(單+批量)","總庫存","按MFD庫存","🖼️ 圖片記錄"])
+    tab_ai, tab_in, tab_out, tab_view, tab_mfd, tab_images = tabs
+
+with tab_ai:
+    st.subheader("📸 AI智能入庫 - V54.6")
+    st.success("💡 V54.6：已支援 SPBMC003-2 / SPBMC002-2 等 -2 變種，Stock分開計 + 429修復")
+    ai_files = st.file_uploader("📷 拍照上傳Inspection Note", type=["jpg","png","jpeg"], accept_multiple_files=True)
+    if ai_files:
+        for idx_file, af in enumerate(ai_files):
+            st.divider()
+            st.markdown(f"#### 📄 文件 {idx_file+1}: {af.name}")
+            c1, c2 = st.columns([1,1])
+            with c1:
+                st.image(af, caption=f"原圖 {af.name}", use_container_width=True)
+                fb_orig, fb_save, _, _ = compress_inspection_dual(af)
+                if fb_orig:
+                    with st.spinner("🔍 辨識中..."):
+                        parsed = ai_parse_inspection_free(fb_orig)
+            with c2:
+                if fb_orig:
+                    st.json(parsed)
+                    if parsed["product_code"]:
+                        sku_info, msg = map_product_code_to_wms_sku(parsed["product_code"], parsed["product_name"], df_master)
+                        if "✅" in msg: st.success(msg)
+                        else: st.error(msg)
+                    else:
+                        sku_info = None
+                        st.warning("未認到Product Code")
+                    try:
+                        default_mfd_date = datetime.datetime.strptime(parsed["mfd"], "%d/%m/%Y").date() if parsed.get("mfd","") else None
+                    except:
+                        default_mfd_date = None
+                    with st.form(f"ai_confirm_{idx_file}"):
+                        default_in = parsed["inspection_note"] or f"IN{now_hk().strftime('%m%d%H%M')}"
+                        default_lot = parsed["lot_no"]
+                        default_qty = parsed["quantity"] if parsed["quantity"]>0 else 0.0
+                        default_unit = parsed["unit"]
+                        ins_no = st.text_input("Inspection Note #", value=default_in, key=f"ins_{idx_file}")
+                        if sku_info:
+                            sku_options = [normalize_sku(sku_info.get("SKU",""))] + [s for s in sku_list if s != normalize_sku(sku_info.get("SKU",""))]
+                        else:
+                            sku_options = [""] + sku_list
+                        selected_sku = st.selectbox("WMS SKU", sku_options, key=f"sku_{idx_file}")
+                        qty_in = st.number_input("入庫數量 QTY", value=float(default_qty), min_value=0.0, step=0.01, key=f"qty_{idx_file}")
+                        mfd_in = st.date_input("MFD", value=default_mfd_date, key=f"mfd_{idx_file}")
+                        lot_in = st.text_input("Lot No", value=default_lot, key=f"lot_{idx_file}")
+                        uom_in = st.selectbox("UOM", ["PCS","KG","BOX"], index=["PCS","KG","BOX"].index(default_unit) if default_unit in ["PCS","KG","BOX"] else 0, key=f"uom_{idx_file}")
+                        rec_date = st.date_input("Receiving Date", value=today_hk(), key=f"rec_{idx_file}")
+                        rec_time = st.time_input("Receiving Time", value=now_hk().time(), key=f"rec_t_{idx_file}")
+                        handwritten = st.text_area("備註/Remark", value="", placeholder="例如：包裝破損", key=f"remark_{idx_file}")
+                        if st.form_submit_button(f"✅ 確認入庫 {qty_in}{uom_in}", type="primary", use_container_width=True):
+                            b64 = base64.b64encode(fb_save).decode("utf-8")
+                            data_url = f"data:image/jpeg;base64,{b64}"
+                            file_name = f"{ins_no}_{uuid.uuid4().hex[:4]}.jpg"
+                            ok_img = append_row_safe("InspectionImages", [ins_no, parsed["product_code"], lot_in, selected_sku, file_name, str(len(fb_save)), data_url, str(qty_in), handwritten, operator, now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), parsed["raw_text"][:4000]])
+                            if not ok_img:
+                                st.error("Google Sheet 忙緊 (429)，圖片未入到，等 1 分鐘再試")
+                            else:
+                                full_dt = datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
+                                mfd_display = f"{mfd_in.strftime('%d/%m/%Y')} | {lot_in}" if mfd_in and lot_in else (mfd_in.strftime('%d/%m/%Y') if mfd_in else lot_in)
+                                base_sku_for_stock = normalize_sku(selected_sku)
+                                display_sku = get_display_sku(base_sku_for_stock, master_map)
+                                ok_in = append_row_safe("Inbound", [full_dt, ins_no, mfd_display, display_sku, str(qty_in), uom_in, operator])
+                                if ok_in:
+                                    st.success(f"🎉 已入庫 {display_sku} {qty_in}{uom_in}")
+                                    st.balloons()
+                                else:
+                                    st.error("Google Sheet 忙緊 (429)，入庫未入到，等 1 分鐘再試，唔好重複㩒")
+
+if role=="admin":
+    with tab_master:
+        st.dataframe(df_master, use_container_width=True, height=350)
+    with tab_bulk_master:
+        f=st.file_uploader("上傳 Master", type=["xlsx","csv"], key="master_up")
+        if f:
+            df_up=pd.read_csv(f) if f.name.endswith(".csv") else pd.read_excel(f)
+            st.dataframe(df_up.head())
+            if st.button("覆蓋上傳"):
+                overwrite_master(df_up); st.success(f"已上傳 {len(df_up)}"); st.rerun()
+
+with tab_in:
+    col1,col2=st.columns([1,1])
+    with col1:
+        st.markdown("**1. 單個入庫 (支援 -2)**")
+        with st.form("in_form", clear_on_submit=True):
+            rec_date=st.date_input("Receiving Date", value=today_hk())
+            rec_time=st.time_input("Receiving Time", value=now_hk().time())
+            ins=st.text_input("Inspection Note #")
+            mfd=st.date_input("MFD", value=None)
+            lot=st.text_input("Lot No")
+            sku=st.selectbox("SKU", [""]+sku_list)
+            qty=st.number_input("QTY", min_value=0.0, step=0.01)
+            uom=st.selectbox("UOM", ["PCS","KG","BOX"])
+            remark=st.text_area("備註")
+            if st.form_submit_button("確認入庫"):
+                full_dt=datetime.datetime.combine(rec_date, rec_time).strftime("%Y-%m-%d %H:%M:%S")
+                mfd_display = f"{mfd.strftime('%d/%m/%Y')} | {lot}" if mfd and lot else (mfd.strftime('%d/%m/%Y') if mfd else lot)
+                base_sku = normalize_sku(sku)
+                display_sku = get_display_sku(base_sku, master_map)
+                ok = append_row("Inbound", [full_dt, ins, mfd_display, display_sku, qty, uom, operator])
+                if ok:
+                    st.success(f"入庫成功 {display_sku} {mfd_display}"); st.rerun()
+                else:
+                    st.error("Google Sheet 忙緊 (429)，未入到，等 1 分鐘再試")
+    with col2:
+        st.markdown("**2. 批量入庫**")
+        f_in=st.file_uploader("上傳入庫Excel/CSV", type=["xlsx","csv"])
+        if f_in:
+            df_in=pd.read_csv(f_in) if f_in.name.endswith(".csv") else pd.read_excel(f_in)
+            st.dataframe(df_in.head())
+            if st.button("確認批量入庫"):
+                rows=[]
+                for _, r in df_in.iterrows():
+                    mfd_val = str(r.get("MFD",""))
+                    lot_val = str(r.get("Lot No","") or r.get("Lot",""))
+                    mfd_display = f"{mfd_val} | {lot_val}" if mfd_val and lot_val and "|" not in mfd_val else mfd_val
+                    sku_raw = str(r.get("SKU",""))
+                    base_sku = normalize_sku(sku_raw)
+                    display_sku = get_display_sku(base_sku, master_map)
+                    rows.append([str(r.get("Receiving Date","") or today_hk()), str(r.get("Inspection Note #","")), mfd_display, display_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
+                ok = append_rows("Inbound", rows)
+                if ok:
+                    st.success(f"已批量入庫 {len(rows)}，支援-2"); st.rerun()
+                else:
+                    st.error("Google Sheet 忙緊 (429)，批量未入到，等 1 分鐘再試")
+    st.divider()
+    st.markdown("**📜 最近入庫紀錄**")
+    df_in_hist = load_df("Inbound")
+    if not df_in_hist.empty:
+        df_in_hist = enrich_with_master(df_in_hist, master_map)
+        st.dataframe(df_in_hist[["SKU_base","顯示","中文名","MFD","QTY","UOM"]].tail(100).sort_index(ascending=False), use_container_width=True, height=300)
+
+with tab_out:
+    col1,col2=st.columns([1,1])
+    with col1:
+        st.markdown("**1. 單個出庫 (支援 -2)**")
+        with st.form("out_form", clear_on_submit=True):
+            rel_date=st.date_input("Release Date", value=today_hk())
+            rel_time=st.time_input("Release Time", value=now_hk().time())
+            tr=st.text_input("Transfer Note #")
+            mfd=st.date_input("MFD", value=None)
+            sku=st.selectbox("SKU *必填", [""]+sku_list, key="sku_out")
+            qty=st.number_input("QTY", min_value=0.0, step=0.01)
+            uom=st.selectbox("UOM", ["PCS","KG","BOX"])
+            if st.form_submit_button("確認出庫"):
+                full_dt=datetime.datetime.combine(rel_date, rel_time).strftime("%Y-%m-%d %H:%M:%S")
+                mfd_str=mfd.strftime("%d/%m/%Y") if mfd else ""
+                base_sku = normalize_sku(sku)
+                display_sku = get_display_sku(base_sku, master_map)
+                ok = append_row("Outbound", [full_dt, tr, mfd_str, display_sku, qty, uom, operator])
+                if ok:
+                    st.success(f"出庫成功 {display_sku} {mfd_str}"); st.rerun()
+                else:
+                    st.error("Google Sheet 忙緊 (429)，未出到，等 1 分鐘再試，唔好重複㩒")
+    with col2:
+        st.markdown("**2. 批量出庫**")
+        f_out=st.file_uploader("上傳出庫Excel/CSV", type=["xlsx","csv"], key="out_bulk")
+        if f_out:
+            df_out=pd.read_csv(f_out) if f_out.name.endswith(".csv") else pd.read_excel(f_out)
+            st.dataframe(df_out.head())
+            if st.button("確認批量出庫"):
+                rows=[]
+                for _, r in df_out.iterrows():
+                    sku_raw = str(r.get("SKU",""))
+                    base_sku = normalize_sku(sku_raw)
+                    display_sku = get_display_sku(base_sku, master_map)
+                    rows.append([str(r.get("Release Date","") or today_hk()), str(r.get("Transfer Note #","")), str(r.get("MFD","")), display_sku, str(r.get("QTY","")), str(r.get("UOM","PCS") or "PCS"), operator])
+                ok = append_rows("Outbound", rows)
+                if ok:
+                    st.success(f"已批量出庫 {len(rows)}"); st.rerun()
+                else:
+                    st.error("Google Sheet 忙緊 (429)，批量未出到，等 1 分鐘再試")
+    st.divider()
+    st.markdown("**📜 最近出庫紀錄**")
+    df_out_hist = load_df("Outbound")
+    if not df_out_hist.empty:
+        df_out_hist = enrich_with_master(df_out_hist, master_map)
+        st.dataframe(df_out_hist[["SKU_base","顯示","中文名","MFD","QTY","UOM"]].tail(100).sort_index(ascending=False), use_container_width=True, height=400)
+
+with tab_view:
+    st.subheader(f"📦 總庫存 - V54.6 支援-2")
+    df_stock = get_stock_df_for_export()
+    if df_stock.empty: st.info("Master未有資料")
     else:
-        fn = "TMS_" + now_hk().strftime("%Y-%m-%d") + ".xlsx"
-        send_xls(TMS_GROUP_ID, b, fn, "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d %H:%M") + "\n" + info)
-    write_daily_log("17:00 OK " + str(info)[:100])
+        show_df = df_stock[["SKU","Desc.","Code","UOM","現有庫存"]].copy()
+        st.dataframe(show_df, use_container_width=True)
+        st.caption(f"共 {len(show_df)} 項，已支援 SPBMC003-2 / SPBMC002-2 分開計庫存")
 
-def send22():
-    log("send22 disabled - NO OCR, NO save, NO reply")
-    return
+with tab_mfd:
+    st.subheader("📅 按MFD庫存")
+    df_stock_mfd = load_df("Stock_MFD")
+    if df_stock_mfd.empty: st.info("暫無MFD庫存")
+    else: st.dataframe(df_stock_mfd, use_container_width=True, height=500)
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.cron import CronTrigger
-sc = BackgroundScheduler(timezone="Asia/Hong_Kong")
-sc.add_job(send17, CronTrigger(hour=17, minute=0, timezone="Asia/Hong_Kong"))
-# 已停用 22:00
-sc.add_job(check_jobs, CronTrigger(minute="*/5", timezone="Asia/Hong_Kong"))
-sc.start()
-
-@app.get("/")
-def root():
-    return {"status": "running", "ocr": "disabled", "cookie_photo_save": "disabled", "dm_reply": "disabled", "time_hkt": now_hk().strftime("%Y-%m-%d %H:%M:%S HKT"), "cookie_photos": len(cookie_photos), "pod_photos": len(pod_photos), "cookie_group_expected": COOKIE_GROUP_ID, "last_webhook": last_webhook, "tms_group": TMS_GROUP_ID, "my_whatsapp": bool(MY_WHATSAPP), "jobs_seen": len(jobs_snapshot), "logs": logs[-30:]}
-
-@app.get("/fix-webhook")
-def fix():
-    url = EVOLUTION_URL + "/webhook/set/" + quote(INSTANCE)
-    head = {"apikey": EVOLUTION_API_KEY}
-    payload = {"webhook": {"enabled": True, "url": BOT_URL + "/webhook", "webhookByEvents": False, "webhookBase64": False, "events": ["MESSAGES_UPSERT"]}}
-    r = requests.post(url, json=payload, headers=head, timeout=20)
-    log("fix-webhook " + str(r.status_code) + " " + r.text[:500])
-    return {"ok": True, "status": r.status_code, "result": r.text[:800]}
-
-@app.get("/check-webhook")
-def checkwh():
-    url = EVOLUTION_URL + "/webhook/find/" + quote(INSTANCE)
-    r = requests.get(url, headers={"apikey": EVOLUTION_API_KEY}, timeout=20)
-    return {"status": r.status_code, "result": r.text[:1500]}
-
-@app.get("/test-22")
-def test22():
-    send22()
-    return {"ok": True, "logs": logs[-20:]}
-@app.get("/test-17")
-def test17():
-    if not TMS_GROUP_ID: return {"ok": False, "logs": ["no TMS_GROUP_ID"]}
-    b, info = tms_daily_xls()
-    if not b: send_text(TMS_GROUP_ID, "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d") + " " + info + " (手動測試)")
-    else: send_xls(TMS_GROUP_ID, b, "TMS_" + now_hk().strftime("%Y-%m-%d") + ".xlsx", "TMS每日提醒 " + now_hk().strftime("%Y-%m-%d %H:%M") + "\n" + info + " (手動測試)")
-    return {"ok": True, "logs": logs[-10:]}
-@app.get("/test-jobs")
-def testjobs():
-    check_jobs()
-    return {"ok": True, "snapshot": jobs_snapshot, "logs": logs[-10:]}
+with tab_images:
+    st.subheader("🖼️ Inspection 圖片記錄")
+    df_img = load_df("InspectionImages")
+    if df_img.empty:
+        st.info("暫無圖片記錄")
+    else:
+        wanted = ["InspectionNote","ProductCode","LotNo","WMS_SKU","FileName","QTY","Handwritten","CreatedAt_HKT"]
+        cols_show = [c for c in wanted if c in df_img.columns]
+        if not cols_show:
+            cols_show = df_img.columns.tolist()[:8]
+        try:
+            sort_key = "CreatedAt_HKT" if "CreatedAt_HKT" in df_img.columns else cols_show[0]
+            st.dataframe(df_img[cols_show].sort_values(by=sort_key, ascending=False).head(100), use_container_width=True)
+        except Exception as e:
+            st.dataframe(df_img[cols_show].head(100), use_container_width=True)
+            st.caption(f"顯示備用模式: {e}")
